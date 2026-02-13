@@ -1,5 +1,5 @@
 {
-  "name": "hypernova",
+  "name": "hypernova-engine",
   "version": "1.0.0",
   "description": "game engine",
   "main": "index.js",
