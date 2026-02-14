@@ -19,7 +19,9 @@ Files: `packages/core/src/spatial/{types,UniformGrid,Quadtree,index}.ts`
   - **Uniform grid (default):** Pre-allocated flat `Int32Array` cell buckets. O(1) cell math from Position SoA arrays. Swap-remove for O(1) entity removal. Generation-counter dedup on queries (no Set allocation). Entity inserted into all overlapping cells; `update()` short-circuits when cell membership unchanged.
   - **Pooled quadtree (optional, for varied-size entities):** SoA node pool + linked-list entry pool, both pre-allocated. Entities stored at smallest enclosing node. Subdivision on capacity overflow with max depth limit. Same generation-counter dedup.
   - **Common interface:** `insert(eid, minX, minY, maxX, maxY)`, `remove(eid)`, `update(eid, ...)`, `queryAABB(..., results: Uint32Array): count`. Caller owns result buffer.
-  - **Integration:** `SpatialIndex` resource, maintained by `SpatialIndexSystem` in `render-prep` stage reading `Position` + optional `AABB`/`Collider`. Config: `spatialIndex: 'grid' | 'quadtree'`.
+  - **Integration:** `SpatialIndex` resource, maintained by `SpatialIndexSystem` in dedicated `spatial` stage (after `physics`, before `post-physics`) reading `Position` + optional `AABB`/`Collider`. Config: `spatialIndex: 'grid' | 'quadtree'`.
+
+**Persistent State** (`@nova/persist`) — SQLite-backed continuous state mirroring with snapshot-based save/load. The SoA arena's typed arrays map directly to SQLite BLOBs via `memcpy` — zero serialization. Background sync via `defineJob`, dirty tracking via scheduler write-sets, named snapshots for save points, crash recovery from live DB state. Cross-platform: `better-sqlite3` (local), `wa-sqlite` + OPFS (web), `@libsql/client` for Turso cloud saves. No existing game engine persistence library combines SoA-native blob storage with continuous mirroring and embedded cloud sync.
 
 **Network Serializer** (`@nova/net`) — Custom binary format for ECS state replication. Evaluated `flatbuffers` and `@msgpack/msgpack`; neither fits. Flatbuffers requires a native schema compiler, cannot return typed array views on decode (issue #8450 closed as "not planned"), and its Builder allocates. Msgpack adds ~25% framing overhead and parses sequentially — and the non-real-time cases (RPC, lobby, debug) are fine with built-in JSON. Game industry universally uses custom binary for real-time state (Unity DOTS Netcode, Quake III, bitECS). HyperNova's SoA data is already in contiguous typed arrays — serialization is essentially memcpy with a thin header. Custom format enables zero-allocation delta compression (change bitmask + scatter/gather) and integrated quantization (f32→u16) in a single pass.
 - **Wire format sketch:**
@@ -56,11 +58,14 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 
 ## Phase 1 — Core ECS + Renderer (foundation)
 
+- [ ] `@nova/core`: Result type, Err enum, Severity enum, EngineError, pre-allocated error singletons, helper utilities (`must`, `orDefault`)
+- [ ] `@nova/core`: DiagnosticLog resource (ring-buffered, zero-alloc in steady state, no-op in prod)
+- [ ] `@nova/core`: `engine.halt()`, error mode configuration (`lenient`/`strict`/`pedantic`)
 - [ ] `@nova/core`: World, Entity (generational IDs), Component (archetype storage), System scheduler (sequential, dependency-graph batched)
-- [ ] `@nova/core`: Game loop (fixed timestep + render interpolation)
+- [ ] `@nova/core`: Game loop (fixed timestep + render interpolation + `maxSubstepsPerFrame` accumulator cap + `BudgetExceeded` event)
 - [ ] `@nova/core`: Event bus, typed resources, math library
 - [ ] `@nova/core`: Entity hierarchy (Parent/Children, transform propagation)
-- [ ] `@nova/core`: Scene loader + prefab instantiation
+- [ ] `@nova/core`: Scene loader + prefab instantiation (includes `extends`/`includes` resolution, `childOverrides`)
 - [ ] `@nova/renderer-webgpu`: WebGPU sprite batching (WebGL2 fallback can come later)
 - [ ] `@nova/input`: Keyboard + mouse basics
 - [ ] Vite plugin: dev server, HMR for systems and assets
@@ -72,7 +77,7 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 - [ ] `@nova/audio`: Basic sound effects + music
 - [ ] `@nova/assets`: Manifest-based loading, hot reload
 - [ ] `@nova/core`: Spatial index (uniform grid)
-- [ ] `@nova/core`: Game state machine + scene transitions
+- [ ] `@nova/core`: Game state machine (resource-guard model, no per-state systems) + scene transitions
 
 ## Phase 3 — Developer experience
 
@@ -94,6 +99,18 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 - [ ] `@nova/native`: WebSocket bridge (server-side ServiceRegistry + client-side NativeBridge resource)
 - [ ] `@nova/native`: `NativeSyncSystem`, `NativeResultBuffer`, ECS event integration (`native:result`, `native:event`)
 - [ ] `@nova/native`: `NativePlugin` registration + graceful degradation on web target
+- [ ] `@nova/persist`: `PersistDriver` interface + in-memory driver (testing)
+- [ ] `@nova/persist`: SQL schema creation, migration, column metadata registration
+- [ ] `@nova/persist`: Dirty column tracking via scheduler write-sets (`PersistMarkSystem`)
+- [ ] `@nova/persist`: Background sync job (`defineJob` worker) — BLOB writes in transaction
+- [ ] `@nova/persist`: Snapshot save (force-sync + bulk copy live → snapshot tables)
+- [ ] `@nova/persist`: Snapshot load (read BLOBs + bulk `TypedArray.set()` restore + query cache invalidation)
+- [ ] `@nova/persist`: Snapshot management (list, delete, prune by `maxSnapshots`)
+- [ ] `@nova/persist`: `PersistPlugin` factory, stage registration, event definitions
+- [ ] `@nova/persist`: `better-sqlite3` driver (local target, runs in `defineJob` worker)
+- [ ] `@nova/persist`: `wa-sqlite` + OPFS driver (web target, `OPFSCoopSyncVFS` in worker)
+- [ ] `@nova/persist`: `@libsql/client` driver (Turso embedded replicas for cloud saves)
+- [ ] `@nova/persist`: Crash recovery detection + `CrashRecoveryAvailable` event
 - [ ] `@nova/renderer-webgpu`: WebGL2 fallback backend
 
 ## Phase 5 — Packaging & Distribution
@@ -135,9 +152,11 @@ Revisit when component storage can be backed by SharedArrayBuffer accessible fro
 ## **Parallel system execution via Web Workers:**
 Evaluated and deferred.  Three critical barriers: (1) `Atomics.wait()` is prohibited on the main browser thread, breaking the barrier mechanism; (2) system functions reference module-level component variables that don't transfer across worker boundaries; (3) resources are JS objects (`Map`, `Set`) that can't live in SharedArrayBuffer. The performance math also doesn't favor it — dispatch overhead (~0.3ms) exceeds the work of typical 2D game systems on typical entity counts. **Decision:** Sequential scheduler with dependency-graph batching. Background workers via `@nova/workers` for async tasks (pathfinding, proc-gen, autosave). If revisited, the viable path is scheduler-on-worker architecture (ECS tick on a dedicated worker, main thread as thin render client). See SPEC.md Appendix D.
 
-## Open
+## Resolved
 
-- What is the minimum viable plugin API? `addPlugin()` currently takes an opaque function — should plugins declare capabilities, dependencies, lifecycle hooks?
+- ~~What is the minimum viable plugin API?~~ → Defined in SPEC.md §17. Plugin = `{ name, depends?, install(app) }`. EngineBuilder provides registration API. Dependency resolution via topological sort. Factory pattern for configurable plugins. See §17.1–17.10.
+
+## Open
 - Should the visual editor support collaborative editing (multiple browser tabs editing the same scene)?
 - What's the serialization format for animation state machines — code-only or `.nova.json`-compatible?
 - Should `@nova/ui` layout run as a system in the ECS pipeline or use a separate layout pass?

@@ -57,7 +57,7 @@ HyperNova is designed around three core principles:
 The game loop uses a **fixed timestep with interpolated rendering**, the gold standard for deterministic simulation:
 
 - **Input** — Polls and buffers all input events from the current frame.
-- **Fixed Update** — Runs simulation logic at a constant rate (default 60 Hz).  Multiple fixed steps may run per frame if the frame budget allows, or none if the frame arrives early.  All gameplay logic, physics, and AI run here.
+- **Fixed Update** — Runs simulation logic at a constant rate (default 60 Hz).  Multiple fixed steps may run per frame if the frame budget allows, or none if the frame arrives early.  All gameplay logic, physics, and AI run here.  The accumulator is capped at `maxSubstepsPerFrame * fixedTimestep` (default: 4 steps) to prevent death spirals — excess time is dropped and the simulation slows relative to wall clock. A `BudgetExceeded` event is emitted when steps are dropped (see §18).
 - **Render** — Runs once per frame at display refresh rate. Interpolates between the previous and current simulation state for smooth visuals even when the simulation rate and display rate differ.
 - **Output** - Haptics, sound, and other side effects are triggered during the fixed update to maintain synchronization with the simulation.
 
@@ -207,6 +207,12 @@ const alive = world.query(Health).not(IsDead);
 const damaged = world.query(Health).changed(Health);
 ```
 
+`.changed(Component)` uses **double-buffered snapshot comparison**: at frame end, each tracked field's live typed array is copied into a snapshot (`snapshot.set(liveArray)` — a memcpy). At query resolution time, `liveArray[eid] !== snapshot[eid]` is checked per archetype-matched entity. Multi-field components short-circuit on first difference.
+
+Snapshots are allocated **only** for components referenced in a `.changed()` query — zero cost when unused. The scheduler's write-set serves as a free coarse pre-filter: if no system that writes the component ran this frame, the comparison is skipped entirely.
+
+This comparison utility is shared with `@nova/net` delta compression and `@nova/devtools` time-travel debugging.
+
 ### System Scheduling
 
 Systems are organized into stages that run in a defined order within each fixed update:
@@ -217,6 +223,7 @@ const engine = new Engine();
 engine.addStage('input', [InputGatherSystem]);
 engine.addStage('pre-physics', [MovementSystem, AISystem]);
 engine.addStage('physics', [PhysicsSyncSystem, PhysicsStepSystem]);
+engine.addStage('spatial', [SpatialIndexSystem]);
 engine.addStage('post-physics', [CollisionResponseSystem]);
 engine.addStage('gameplay', [DamageSystem, DeathSystem, SpawnSystem]);
 engine.addStage('render-prep', [SpriteAnimationSystem, CameraSystem]);
@@ -902,6 +909,349 @@ const jitter = clock.jitter;          // RTT variance
 
 ---
 
+## 9.5 Persistent State — `@nova/persist`
+
+### Overview
+
+Save/load is fundamental to game engines, but traditional approaches (serialize everything on save, deserialize on load) are O(entities x components) — slow and fragile. HyperNova's SoA arena already stores all component data as contiguous typed arrays. SQLite stores BLOBs as flat byte buffers. The mapping between them is `memcpy` — zero serialization, zero per-entity iteration.
+
+`@nova/persist` is an opt-in plugin that uses **SQLite as a continuously-mirrored shadow of the ECS arena**. The database is kept in sync with the typed arrays via periodic background flushes. Save/load reduces to snapshot management:
+
+- **Save** = tag the current mirrored state with a name (data is already on disk)
+- **Load** = restore a tagged state and bulk-copy BLOBs back into the arena
+- **Crash recovery** = on unclean shutdown, the live database has the last synced state
+
+This transforms save/load from O(entities x components) traversal into O(columns) bulk copies. For a game with 20 component fields and 50,000 entities, saving copies 20 BLOBs instead of walking 50,000 entities.
+
+### SQLite Schema
+
+The schema mirrors the SoA arena structure. Each component field column is stored as a single BLOB row — not one row per entity.
+
+```sql
+-- Column metadata (written once per defineComponent)
+CREATE TABLE nova_columns (
+  column_id         INTEGER PRIMARY KEY,
+  component         TEXT NOT NULL,
+  field             TEXT NOT NULL,
+  typed_array_type  TEXT NOT NULL,     -- 'Float32Array', 'Uint32Array', etc.
+  bytes_per_element INTEGER NOT NULL,
+  UNIQUE(component, field)
+);
+
+-- Live state: one row per column, continuously updated
+CREATE TABLE nova_live (
+  column_id   INTEGER PRIMARY KEY REFERENCES nova_columns(column_id),
+  data        BLOB NOT NULL,           -- raw typed array bytes
+  sync_tick   INTEGER NOT NULL DEFAULT 0
+);
+
+-- Entity metadata (singleton row)
+CREATE TABLE nova_entities (
+  id          INTEGER PRIMARY KEY DEFAULT 1,
+  generations BLOB NOT NULL,           -- Uint16Array[maxEntities] raw bytes
+  archetypes  BLOB NOT NULL,           -- bitmask array raw bytes
+  free_list   BLOB NOT NULL,
+  alive_count INTEGER NOT NULL,
+  max_eid     INTEGER NOT NULL,
+  tick        INTEGER NOT NULL DEFAULT 0
+);
+
+-- String interning (mirrors global StringTable)
+CREATE TABLE nova_strings (
+  intern_id   INTEGER PRIMARY KEY,
+  value       TEXT NOT NULL
+);
+
+-- Typed resources (opt-in only)
+CREATE TABLE nova_resources (
+  token_id    INTEGER PRIMARY KEY,
+  name        TEXT NOT NULL,
+  data        BLOB,                    -- binary serializable resources
+  json        TEXT                     -- JSON serializable resources
+);
+
+-- Named snapshots (save points)
+CREATE TABLE nova_snapshots (
+  snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL UNIQUE,
+  tick        INTEGER NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  metadata    TEXT                     -- JSON: playtime, scene, custom data
+);
+
+-- Snapshot column data (full copies)
+CREATE TABLE nova_snapshot_columns (
+  snapshot_id INTEGER REFERENCES nova_snapshots(snapshot_id) ON DELETE CASCADE,
+  column_id   INTEGER REFERENCES nova_columns(column_id),
+  data        BLOB NOT NULL,
+  PRIMARY KEY (snapshot_id, column_id)
+);
+
+-- (+ corresponding snapshot tables for entities, strings, resources)
+```
+
+**Key design decision:** One row per *column*, not per entity. A game with 50K entities and 20 f32 fields has 20 rows in `nova_live`. Every sync is 20 `UPDATE` statements with BLOB binds. Each BLOB is a direct copy of the typed array's underlying `ArrayBuffer` region.
+
+### Dirty Column Tracking (Persistence)
+
+The system scheduler already knows which systems write which components (from `query().write(Position)` declarations). A lightweight `PersistMarkSystem` runs at the end of each frame and checks the scheduler's write-set — O(systems_that_ran), not O(entities).
+
+False positives (system declared write but didn't modify anything) are acceptable. The cost is one unnecessary ~200KB BLOB copy every few seconds — well within a worker's budget.
+
+This is **column-level** tracking (was *any* entity's Health written?) used for persistence sync. For **entity-level** change detection (`.changed()` queries), see [Queries — change detection](#queries).
+
+### Entity-Level Change Detection
+
+The `.changed(Component)` query filter provides per-entity precision via double-buffered snapshot comparison. A `ChangeDetectionSnapshotSystem` runs at frame end (same stage as `PersistMarkSystem`) and copies each tracked field's live array into its snapshot:
+
+```
+frame-end stage:
+  PersistMarkSystem:            check scheduler write-sets → mark dirty columns
+  ChangeDetectionSnapshotSystem: snapshot.set(liveArray) for each tracked field
+```
+
+The two mechanisms are complementary:
+- **Column-level dirty flags** → persistence decides *which columns* to sync (coarse, O(systems))
+- **Snapshot comparison** → `.changed()` queries find *which entities* changed (precise, O(matched entities))
+
+The scheduler write-set also serves as a free pre-filter for snapshot comparison: if no writer system ran for a component, `.changed()` returns zero entities without any comparison.
+
+### Background Sync
+
+Sync runs as a `defineJob` periodic worker (same pattern as `AutosaveJob` in §10).
+
+```
+MAIN THREAD                                    WORKER (defineJob)
+===========                                    ==================
+
+persist-mark stage (after render-prep):
+  check scheduler write-sets → mark dirty columns
+
+Every N seconds (sync interval):
+  collect dirty columns:
+    data = typedArray.slice()              ──►  BEGIN TRANSACTION
+  transfer via Transferable (zero-copy)          UPDATE nova_live SET data=? (per column)
+                                                 UPDATE nova_entities ...
+                                                COMMIT
+                                                return { synced, tick }
+                                           ◄──
+  worker-sync stage:
+    drain result, update sync watermarks
+```
+
+### Save Operation
+
+```
+persist.save('checkpoint-3')
+  1. Force-sync all dirty columns (immediate flush)
+  2. Worker executes:
+     INSERT INTO nova_snapshots (name, tick, ...) ...
+     INSERT INTO nova_snapshot_columns SELECT ... FROM nova_live   -- bulk copy
+     (+ entity metadata, string table, resources)
+  3. Emit SaveCompleted event
+```
+
+Save is O(columns): a handful of SQL INSERT statements copying existing BLOBs.
+
+### Load Operation
+
+```
+persist.load('checkpoint-3')
+  1. Pause game loop
+  2. Worker reads all snapshot BLOBs, transfers via Transferable
+  3. Main thread (at stage boundary, atomically):
+     for each column: targetArray.set(new TypedArrayConstructor(blob))
+     restore entity metadata (generations, archetypes, free list)
+     restore string table
+     restore resources
+     invalidate all query caches
+  4. Resume game loop, emit LoadCompleted event
+```
+
+Main-thread restore for 20 columns x 200KB = 4MB total `memcpy`: well under 1ms.
+
+### Component Persistence Control
+
+Components persist by default — define-and-forget. Opt out per-component or at the plugin level:
+
+```typescript
+// Persists by default
+const Position = defineComponent({ x: Types.f32, y: Types.f32 });
+
+// Explicitly transient
+const ParticleVelocity = defineComponent(
+  { x: Types.f32, y: Types.f32 },
+  { persist: false }
+);
+```
+
+Resources do **not** persist by default (most are runtime handles). Explicitly opt in via plugin config.
+
+| Category | Persist? | Examples |
+|----------|----------|----------|
+| Gameplay state | Yes (default) | Position, Health, Inventory |
+| Scene metadata | Yes (default) | Name, SceneEntity, PrefabInstance |
+| Physics config | Yes (default) | RigidBody, Collider (setup, not live state) |
+| Physics runtime | No (exclude) | Rapier-owned velocity state |
+| Particles | No (exclude) | ParticlePosition, ParticleLifetime |
+| Debug/editor | No (exclude) | DebugOverlay, EditorOnly, GizmoHighlight |
+| Render cache | No (exclude) | RenderBatch, SortKey |
+
+### Plugin Configuration
+
+```typescript
+import { PersistPlugin } from '@nova/persist';
+
+engine.addPlugin(PersistPlugin({
+  dbName: 'my-game',                   // database name
+  driver: 'auto',                      // auto-detect platform
+  syncIntervalMs: 5000,                // flush every 5 seconds
+  immediateOn: [SceneLoaded],          // force-sync on specific events
+  exclude: [ParticleVelocity, DebugOverlay],
+  resources: [GameState, QuestLog],    // opt-in resource persistence
+  maxSnapshots: 100,                   // auto-prune oldest
+
+  // Optional: Turso cloud sync (libsql embedded replicas)
+  turso: {
+    url: 'libsql://saves.my-game.turso.io',
+    authToken: process.env.TURSO_TOKEN,
+    syncInterval: 60_000,              // cloud sync every 60s
+  },
+}));
+```
+
+### Public API
+
+```typescript
+// PersistStore resource — game's interface to save/load
+interface PersistStore {
+  save(name: string, metadata?: Record<string, unknown>): SaveTicket;
+  load(name: string): LoadTicket;
+  quickSave(): SaveTicket;             // saves as '__quicksave'
+  quickLoad(): LoadTicket;             // loads '__quicksave'
+  listSnapshots(): SnapshotInfo[];
+  deleteSnapshot(name: string): void;
+  forceSyncNow(): void;
+  readonly lastSyncTick: number;
+  readonly isDirty: boolean;
+}
+
+interface SnapshotInfo {
+  name: string;
+  tick: number;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+}
+
+// Ticket pattern (matches TaskTicket/NativeTicket conventions)
+interface SaveTicket {
+  readonly id: number;
+  readonly status: 'pending' | 'syncing' | 'snapshotting' | 'completed' | 'failed';
+}
+
+interface LoadTicket {
+  readonly id: number;
+  readonly status: 'pending' | 'reading' | 'restoring' | 'completed' | 'failed';
+}
+```
+
+### Events
+
+```typescript
+const SaveCompleted = defineEvent<{ name: string; tick: number; durationMs: number }>();
+const LoadCompleted = defineEvent<{ name: string; tick: number; durationMs: number }>();
+const CrashRecoveryAvailable = defineEvent<{ tick: number; lastSyncTimestamp: number }>();
+const PersistError = defineEvent<{ operation: 'save' | 'load' | 'sync'; error: EngineError }>();
+```
+
+### Usage in Systems
+
+```typescript
+const SaveLoadSystem = defineSystem({
+  name: 'SaveLoad',
+  resources: { read: [PersistStore, InputState] },
+  events: { read: [SaveCompleted, LoadCompleted] },
+  execute({ resources, events }) {
+    const persist = resources.get(PersistStore);
+    const input = resources.get(InputState);
+
+    if (input.justPressed('quicksave')) persist.quickSave();
+    if (input.justPressed('quickload')) persist.quickLoad();
+
+    for (const evt of events.read(SaveCompleted)) {
+      showNotification(`Saved "${evt.name}" (${evt.durationMs}ms)`);
+    }
+  },
+});
+```
+
+### Cross-Platform Drivers
+
+`@nova/persist` defines an abstract `PersistDriver` interface. Platform-specific implementations are auto-selected:
+
+| Target | Driver | Notes |
+|--------|--------|-------|
+| Local (Node.js) | `better-sqlite3` in worker | Synchronous, fastest, via `defineJob` |
+| Local + cloud | `@libsql/client` | Turso embedded replicas for cloud saves |
+| Web | `wa-sqlite` + OPFS | Persistent, requires COOP/COEP headers (already needed for `SharedArrayBuffer`) |
+| Web fallback | `wa-sqlite` + IndexedDB VFS | Wider browser support |
+| Testing | In-memory SQLite | No persistence, fast tests |
+
+The fallback chain is transparent to game code. On web, `wa-sqlite` with OPFS requires the `OPFSCoopSyncVFS` running in a worker (same execution model as the sync job). `PRAGMA journal_mode=truncate` and an increased page cache (16MB) are recommended for OPFS performance.
+
+### Relationship to `@nova/net` Serializer
+
+`@nova/persist` and `WorldSerializer` are complementary, not redundant:
+
+| | `@nova/net` WorldSerializer | `@nova/persist` |
+|--|---------------------------|-----------------|
+| Purpose | Network replication | Disk persistence |
+| Frequency | Every tick (60Hz) | Every N seconds |
+| Fidelity | Lossy (quantized) | Lossless |
+| Scope | Component subset | All persistent |
+| Format | Custom binary wire protocol | Raw typed array BLOBs in SQLite |
+| Delta | Change bitmask per tick | Full column replacement |
+
+The change bitmask diff utility (used by `@nova/net` for delta compression) should be extracted to `@nova/core` as a shared utility — `@nova/persist` reuses it for time-travel debugging in devtools.
+
+### Advanced Capabilities
+
+**Crash recovery:** On startup, the plugin checks for a non-zero tick in `nova_entities`. If found, the previous session did not shut down cleanly — a `CrashRecoveryAvailable` event is emitted with the last synced tick and timestamp. The game can offer "Continue from last session?" or auto-restore.
+
+**Cloud saves via Turso:** When configured, `@libsql/client` creates an embedded replica — a local SQLite database that syncs to a remote Turso instance. Saves work offline; cloud sync happens when connection returns. This gives cross-device save continuity with zero extra code in game systems.
+
+**Time-travel debugging (devtools only):** When `@nova/devtools` is active, the persist system can log per-tick deltas using `@nova/net`'s change bitmask format. A retention window (default: 600 ticks / 10 seconds) enables stepping backwards in the inspector, viewing state at any past tick, and visual diffing of component values. Tree-shaken from production builds.
+
+**Editor undo/redo:** Micro-snapshots that capture only the columns modified by an editor operation. The undo stack stores "before" BLOBs; undo restores them, redo stores "after". Integrates with the visual editor's existing round-trip persistence (§13).
+
+### Package Structure
+
+```
+packages/persist/
+  src/
+    index.ts              -- public exports
+    plugin.ts             -- PersistPlugin factory
+    types.ts              -- config, PersistStore, tickets, events
+    schema.ts             -- SQL DDL + migration
+    driver/
+      types.ts            -- PersistDriver interface
+      better-sqlite3.ts   -- local target
+      wa-sqlite.ts        -- web target (OPFS)
+      libsql.ts           -- Turso cloud sync
+      memory.ts           -- testing
+    change-detection.ts   -- snapshot comparison utility (shared with @nova/net, @nova/devtools)
+    sync/
+      dirty-tracker.ts    -- column dirty state
+      sync-job.ts         -- defineJob worker
+      sync-system.ts      -- PersistMarkSystem + ChangeDetectionSnapshotSystem + result drain
+    snapshot/
+      save.ts             -- snapshot creation
+      load.ts             -- snapshot restore
+      manager.ts          -- list/delete/prune
+```
+
+---
+
 ## 10. Background Workers
 
 ### Overview
@@ -982,7 +1332,9 @@ const ticket = pool.submit(PathfindTask, {
 
 - Size defaults to `navigator.hardwareConcurrency - 1` (minimum 1).
 - Tasks execute in submission order (FIFO queue).
-- Configurable timeout per task — exceeded tasks are failed, and the stuck worker is terminated and replaced.
+- Configurable timeout per task (override with `timeout` in `defineTask()`, default: pool-level `taskTimeout`). Exceeded tasks transition to `'timedOut'` status. The stuck worker is terminated and replaced automatically.
+
+> **Transferred buffer loss:** When a task transfers an `ArrayBuffer` (ownership moves to the worker) and the worker is terminated for timeout, that buffer is irrecoverably lost. Use `SharedArrayBuffer` for data that must survive worker failures, or clone the data before transfer if the cost is acceptable.
 
 ### Periodic Jobs
 
@@ -1074,7 +1426,12 @@ const ApplyPathfindingSystem = defineSystem({
   events: { read: [WorkerResult] },
   execute({ events }) {
     for (const result of events.read(WorkerResult)) {
-      if (result.taskName !== 'pathfind' || result.status !== 'resolved') continue;
+      if (result.taskName !== 'pathfind') continue;
+      if (result.status === 'timedOut') {
+        // Task exceeded timeout — worker was replaced, transferred buffers are lost
+        continue;
+      }
+      if (result.status !== 'resolved') continue;
       const { entityId, path } = result.data as PathfindResult;
       PathFollower.waypointCount[entityId] = path.length / 2;
       // Copy path into component storage...
@@ -1090,6 +1447,7 @@ engine.addStage('input',        [InputGatherSystem]);
 engine.addStage('worker-sync',  [WorkerSyncSystem]);
 engine.addStage('pre-physics',  [MovementSystem, AISystem, ApplyPathfindingSystem]);
 engine.addStage('physics',      [PhysicsSyncSystem, PhysicsStepSystem]);
+engine.addStage('spatial',      [SpatialIndexSystem]);
 engine.addStage('post-physics', [CollisionResponseSystem]);
 engine.addStage('gameplay',     [DamageSystem, DeathSystem, SpawnSystem]);
 engine.addStage('render-prep',  [SpriteAnimationSystem, CameraSystem]);
@@ -1276,10 +1634,12 @@ interface NativeTicket<T> {
   readonly id: number;
   readonly service: string;
   readonly method: string;
-  readonly status: 'pending' | 'resolved' | 'rejected';
+  readonly status: 'pending' | 'resolved' | 'rejected' | 'disconnected';
   // Not a Promise — no .then(), no await
 }
 ```
+
+When the WebSocket closes, all pending tickets transition to `'disconnected'`. The `NativeSyncSystem` emits `NativeResult` events with `ok: false` for each.
 
 ### ECS Integration
 
@@ -1326,6 +1686,30 @@ engine.addStage('pre-physics',  [MovementSystem, AISystem, ApplySerialDataSystem
 The `native-sync` stage runs after `worker-sync` and before gameplay systems. Native calls submitted during gameplay are processed by the server between frames and consumed at the start of the next frame's `native-sync` stage.
 
 For high-frequency data (e.g., serial port at 115200 baud), multiple events may accumulate per frame. All are delivered as a single batch during `native-sync`, giving systems a deterministic set to process.
+
+### Disconnection & Reconnection
+
+When the WebSocket to the native server drops:
+
+1. `NativeBridge.available` becomes `false`.
+2. All pending `NativeTicket`s transition to `'disconnected'` status.
+3. `NativeSyncSystem` emits `NativeResult` events with `ok: false` for each pending ticket.
+4. A `BridgeDisconnected` event is emitted (see §18.9).
+5. Auto-reconnect begins with exponential backoff (configurable):
+
+```typescript
+engine.addPlugin(NativePlugin({
+  clients: [Serial, GPIO],
+  reconnect: {
+    enabled: true,          // default: true
+    initialDelay: 500,      // ms
+    maxDelay: 10_000,       // ms
+    backoffFactor: 2,
+  },
+}));
+```
+
+On successful reconnect, `NativeBridge.available` becomes `true` and a `BridgeReconnected` event is emitted.
 
 ### Graceful Degradation
 
@@ -1432,7 +1816,7 @@ The Vite plugin enables HMR for game code:
 - **System hot reload.** Change a system's `execute` function → the running game swaps it in without losing world state.
 - **Component schema changes.** Adding a field to a component triggers a world migration — existing entities get default values for the new field.
 - **Asset hot reload.** Change a PNG on disk → the texture updates on screen.
-- **Scene hot reload.** Edit a `.nova.json` scene file → entities are diffed and patched in-place without restarting.
+- **Scene hot reload.** Edit a `.nova.json` scene file → entities are diffed and patched in-place without restarting.  These need to include the version number of the engine they were created with.
 
 ### Devtools Panel
 
@@ -1527,6 +1911,128 @@ const PlayerPrefab = definePrefab('Player', {
 });
 ```
 
+#### Prefab Inheritance (`extends`)
+
+A prefab can extend exactly one base prefab, inheriting all components and children. The derived prefab overrides inherited values via shallow merge per component and may add new components. Chains are allowed.
+
+```typescript
+const EnemyPrefab = definePrefab('Enemy', {
+  Position: { x: 0, y: 0 },
+  Sprite: { texture: 'enemy', width: 32, height: 32 },
+  Health: { current: 100, max: 100 },
+  AI: { behavior: 'patrol' },
+  children: [
+    { name: 'Shadow', components: {
+      Sprite: { texture: 'shadow', width: 32, height: 8 },
+      Position: { x: 0, y: 28 },
+    }},
+  ],
+});
+
+const BossEnemyPrefab = definePrefab('BossEnemy', {
+  extends: EnemyPrefab,
+  // Override specific fields — shallow merge per component
+  Sprite: { texture: 'boss', width: 64, height: 64 },
+  Health: { current: 500, max: 500 },
+  // Add new components
+  Boss: { phase: 1 },
+  // Inherited unchanged: Position, AI, children (Shadow)
+});
+
+// Chains work — MegaBoss inherits from BossEnemy which inherits from Enemy
+const MegaBossPrefab = definePrefab('MegaBoss', {
+  extends: BossEnemyPrefab,
+  Health: { current: 2000, max: 2000 },
+  Boss: { phase: 1, enrageThreshold: 0.25 },
+});
+```
+
+> Convention: inheritance chains deeper than 3 are a code smell. Prefer composition via `includes` for mixing orthogonal behaviors.
+
+#### Prefab Composition (`includes`)
+
+A prefab can include multiple other prefabs to compose orthogonal behaviors. Included prefabs are merged left-to-right; later includes override earlier ones for conflicting fields. The defining prefab's own declarations always win.
+
+```typescript
+const DamageableMixin = definePrefab('Damageable', {
+  Health: { current: 100, max: 100 },
+  HitFlash: { duration: 0.1, color: '#ff0000' },
+});
+
+const LootableMixin = definePrefab('Lootable', {
+  LootTable: { table: 'default', dropChance: 0.5 },
+});
+
+const AnimatedMixin = definePrefab('Animated', {
+  AnimationState: { current: 'idle', speed: 1.0 },
+});
+
+const TreasureChestPrefab = definePrefab('TreasureChest', {
+  includes: [DamageableMixin, LootableMixin, AnimatedMixin],
+  Position: { x: 0, y: 0 },
+  Sprite: { texture: 'chest', width: 32, height: 32 },
+  Health: { current: 50, max: 50 },  // overrides DamageableMixin
+  Collider: { shape: 'box', width: 32, height: 32 },
+});
+```
+
+#### Combined `extends` + `includes`
+
+Both mechanisms can be used together:
+
+```typescript
+const SkeletonPrefab = definePrefab('Skeleton', {
+  extends: EnemyPrefab,
+  includes: [DamageableMixin, LootableMixin],
+  Sprite: { texture: 'skeleton', width: 32, height: 32 },
+  AI: { behavior: 'chase' },
+  // Health from DamageableMixin overrides EnemyPrefab's Health
+  // LootTable from LootableMixin
+  // Position from EnemyPrefab base
+  // Sprite from own declaration overrides everything
+});
+```
+
+#### Merge Semantics
+
+Components are resolved via **shallow object merge per component** — matching the existing spawn-override behavior. Given components `A = { x: 1, y: 2 }` and `B = { y: 3, z: 4 }`, the merge `A + B` produces `{ x: 1, y: 3, z: 4 }`.
+
+Layers are applied in deterministic order, each overriding the previous:
+
+```
+Layer 0:  extends chain (deepest ancestor first, resolved recursively)
+Layer 1:  includes[0]
+Layer 2:  includes[1]
+...
+Layer N:  includes[last]
+Layer N+1: Own declarations (always win)
+```
+
+**Children** merge by `name` across layers using the same component-merge rule. Children without a `name` are never merged — they are always appended. New children from later layers are appended after inherited children.
+
+**Component removal** is intentionally unsupported. A derived prefab cannot remove a component from its base or includes — this would break the "is-a" contract of `extends` and the "has-a" contract of `includes`. If an entity should not have a particular component, create a new prefab that does not extend/include the one that defines it.
+
+**Resolution** happens once at `definePrefab()` time. The result is a flattened component map cached on the `PrefabToken`. There is no per-spawn resolution cost.
+
+**Circular references** in `extends` chains or `includes` graphs are detected at `definePrefab()` time and throw a fatal error.
+
+**Diamond includes** (A includes B and C, both of which include D) are allowed. D's components appear once — the leftmost occurrence establishes the baseline, and subsequent occurrences are no-ops since D is already merged.
+
+#### Spawn-Time Child Overrides
+
+The `world.spawn()` API accepts an optional `childOverrides` key for overriding inherited children's components:
+
+```typescript
+const boss = world.spawn(BossEnemyPrefab, {
+  Position: { x: 500, y: 200 },
+  childOverrides: {
+    'Shadow': { Sprite: { texture: 'boss-shadow', width: 64, height: 8 } },
+  },
+});
+```
+
+The `childOverrides` key is reserved and cannot conflict with component names (component names are PascalCase by convention; `childOverrides` is camelCase).
+
 ### Scene Files
 
 Scene files are JSON documents that describe a collection of entities:
@@ -1534,6 +2040,7 @@ Scene files are JSON documents that describe a collection of entities:
 ```json
 {
   "name": "Level1",
+  "engineVersion": "1.0.0",
   "entities": [
     {
       "name": "Player",
@@ -1566,6 +2073,27 @@ Scene files are JSON documents that describe a collection of entities:
 When a scene references a prefab, only the **overridden fields** are stored in the scene file.
 This keeps scene files small and means updating a prefab definition automatically updates all instances that haven't overridden that field.
 
+**Cascade behavior**: Overrides are computed against the **resolved** (flattened) prefab, not against any particular layer in the inheritance chain. If a base prefab changes a default value, all scene instances whose overrides do not explicitly set that field will pick up the new value automatically.
+
+Scene entities may include `childOverrides` to override component values on inherited children without redefining the entire child hierarchy:
+
+```json
+{
+  "name": "MyBoss",
+  "prefab": "BossEnemy",
+  "components": {
+    "Position": { "x": 500, "y": 200 }
+  },
+  "childOverrides": {
+    "Shadow": {
+      "components": {
+        "Sprite": { "texture": "boss-shadow", "width": 64, "height": 8 }
+      }
+    }
+  }
+}
+```
+
 ### Scene Loading
 
 ```typescript
@@ -1593,9 +2121,11 @@ const SceneEntity = defineComponent({
   entityIndex: Types.u32,   // index within the scene
 });
 const PrefabInstance = defineComponent({
-  prefabId: Types.string,   // which prefab, if any
+  prefabId: Types.string,   // concrete prefab name (e.g. 'BossEnemy', not the chain)
 });
 ```
+
+`PrefabInstance.prefabId` stores the **concrete** prefab name only. Inheritance lineage is a definition-time concern resolved before spawning. The editor and tooling can look up the full chain from the prefab registry via `PrefabToken.base` and `PrefabToken.includes`.
 
 The `EditorOnly` tag component marks entities that exist only in development mode and are stripped from production builds.
 
@@ -1679,7 +2209,9 @@ The `EditorOnly` tag component marks entities that exist only in development mod
 | Texture / asset ref | Asset picker with preview thumbnail |
 
 - Changes apply immediately to the live ECS world (no "apply" button)
-- "Reset to prefab default" per-field when the entity is a prefab instance
+- "Reset to prefab default" per-field when the entity is a prefab instance (resets to the resolved default, considering the full inheritance chain)
+- **Lineage breadcrumb**: when inspecting a prefab instance, show the inheritance chain (e.g. `Enemy > BossEnemy`) with clickable links to navigate to parent prefab definitions
+- **Field provenance**: each component field indicates its source layer — *inherited* (dimmed), *own* (normal), or *overridden* (bold, with reset icon)
 - Add/remove component buttons
 
 **Viewport Gizmos:**
@@ -1693,6 +2225,9 @@ The `EditorOnly` tag component marks entities that exist only in development mod
 - Edit prefab defaults — all non-overridden instances update live
 - Override tracking: fields that differ from the prefab are marked with a visual indicator
 - "Apply to prefab" button to push instance overrides back to the prefab definition
+- **Lineage view**: display the `extends` chain and `includes` list for the selected prefab
+- **Effective component table**: show all components on the resolved prefab with source annotations (which layer each field originates from)
+- Children inherited from a base are visually distinguished from children defined directly on the prefab
 
 ### Round-Trip Persistence
 
@@ -1715,7 +2250,9 @@ The core challenge: how do visual edits become files the developer commits to so
 const engine = new Engine({
   width: 800,
   height: 600,
-  editor: true,  // enables visual editor panels + scene persistence
+  editor: true,              // enables visual editor panels + scene persistence
+  maxSubstepsPerFrame: 4,    // cap fixed update accumulator (see §18)
+  errorMode: 'lenient',      // 'lenient' | 'strict' | 'pedantic' (see §18.4)
 });
 
 // Or via URL parameter:  ?editor=true
@@ -1730,21 +2267,22 @@ The visual editor is part of `@nova/devtools` and is completely tree-shaken from
 
 ### State Machine
 
-Games need high-level state management — menu → playing → paused → game over. HyperNova provides a simple state stack:
+Games need high-level state management — menu → playing → paused → game over. HyperNova provides a stack-based state machine. States are **lifecycle and scene containers**, not system containers. All systems are registered globally in the stage pipeline; state-aware systems read the `StateStack` resource to decide whether to run.
+
+#### Defining States
 
 ```typescript
-import { defineState, StatePlugin } from '@nova/core';
+import { defineState, StatePlugin, StateStack } from '@nova/core';
 
 const MenuState = defineState({
   name: 'Menu',
   scene: 'assets/scenes/menu.nova.json',
   onEnter({ engine }) {
-    // Set up menu-specific systems, show UI
+    // Called when this state becomes the active (top-of-stack) state
   },
   onExit({ engine }) {
-    // Tear down menu state
+    // Called when this state is removed from the stack
   },
-  systems: [MenuInputSystem, MenuRenderSystem],
 });
 
 const PlayingState = defineState({
@@ -1753,7 +2291,6 @@ const PlayingState = defineState({
   onEnter({ engine }) { /* ... */ },
   onPause({ engine }) { /* called when another state pushes on top */ },
   onResume({ engine }) { /* called when the state above pops */ },
-  systems: [PlayerInputSystem, MovementSystem, PhysicsStepSystem],
 });
 
 engine.addPlugin(StatePlugin({ initial: MenuState }));
@@ -1763,6 +2300,68 @@ engine.states.push(PlayingState);      // push onto stack (Menu pauses)
 engine.states.pop();                   // pop back to Menu
 engine.states.switch(GameOverState);   // replace top of stack
 ```
+
+#### Global Systems & the Resource Guard Pattern
+
+All systems are globally registered via `addStage()` / `addSystem()` and run every frame. Systems that should only execute in certain game states guard on the `StateStack` resource:
+
+```typescript
+const MenuInputSystem = defineSystem({
+  name: 'MenuInput',
+  resourceReads: [StateStack, InputState],
+  execute({ resources }) {
+    const states = resources.get(StateStack);
+    if (states.current.name !== 'Menu') return;
+    // ... menu-specific input handling
+  },
+});
+
+const PlayerMovementSystem = defineSystem({
+  name: 'PlayerMovement',
+  resourceReads: [StateStack],
+  writes: [Position, Velocity],
+  execute({ resources, query }) {
+    const states = resources.get(StateStack);
+    if (states.current.name !== 'Playing') return;
+    // ... gameplay movement logic
+  },
+});
+```
+
+This keeps the stage pipeline static — no systems are added or removed at runtime. The scheduler's dependency graph is built once at startup and remains stable across state transitions.
+
+#### StateStack Resource
+
+`StatePlugin` provides the `StateStack` resource:
+
+```typescript
+interface StateStack {
+  readonly current: StateToken;          // top-of-stack (active state)
+  readonly stack: ReadonlyArray<StateToken>;  // full stack, bottom to top
+  push(state: StateToken, options?: TransitionOptions): void;
+  pop(options?: TransitionOptions): void;
+  switch(state: StateToken, options?: TransitionOptions): void;
+}
+```
+
+#### State Lifecycle
+
+State transitions are **deferred commands** — they are queued when called and applied at the next stage-boundary command flush, guaranteeing no lifecycle callbacks fire mid-stage.
+
+**`push(NewState)`:**
+1. `currentState.onPause()` is called.
+2. `NewState`'s scene is loaded (if `scene` is specified).
+3. `NewState.onEnter()` is called.
+4. `StateStack.current` now points to `NewState`.
+
+**`pop()`:**
+1. `topState.onExit()` is called.
+2. `topState`'s scene entities are destroyed (unless marked persistent).
+3. `previousState.onResume()` is called.
+4. `StateStack.current` now points to `previousState`.
+
+**`switch(NewState)`:**
+Equivalent to `pop()` then `push(NewState)`, executed atomically within a single command flush.
 
 ### Scene Transitions
 
@@ -1808,7 +2407,7 @@ const nearby = spatial.query(new AABB(x - 100, y - 100, x + 100, y + 100));
 // Returns entity IDs within the bounding box
 ```
 
-The spatial index is automatically maintained by a `SpatialIndexSystem` that runs in `render-prep`. It reads `Position` and optionally `AABB`/`Collider` for bounds.
+The spatial index is automatically maintained by a `SpatialIndexSystem` that runs in the dedicated `spatial` stage (immediately after `physics`, before `post-physics`). It reads `Position` and optionally `AABB`/`Collider` for bounds. Because physics is the last stage that modifies positions, all subsequent stages — `post-physics`, `gameplay`, and `render-prep` — see current-frame spatial data.
 
 ---
 
@@ -1974,6 +2573,547 @@ For all export targets to work correctly, `@nova/vite-plugin` must:
 | Mobile | Yes | No |
 | Build deps | None | None |
 | Save to disk | IndexedDB | Via `@nova/native` service |
+
+---
+
+## 17. Plugin System
+
+Every optional subsystem in HyperNova — renderer, physics, input, workers, native bridge, game states — integrates through the same plugin protocol. A plugin is a **named setup function** that receives a registration context and returns an optional cleanup function. No classes, no inheritance, no registration ceremonies — just a function that tells the engine what to set up.
+
+The ECS world itself is the integration layer. Plugins communicate at runtime through components, resources, and events — not through each other.
+
+### 17.1 Plugin Interface
+
+```typescript
+interface Plugin {
+  readonly name: string;
+  readonly depends?: string[];
+  install(app: EngineBuilder): PluginResult | Promise<PluginResult>;
+}
+
+type PluginResult = void | CleanupFn | EngineError;
+type CleanupFn = () => void;
+```
+
+Three fields, one required method. If `install()` returns an `EngineError`, the engine collects it and halts before the first frame — after all plugins have attempted installation, so the developer sees ALL failures at once.
+
+| Field | Purpose |
+|-------|---------|
+| `name` | Unique string identifier. Used for dependency resolution, debugging, hot-reload targeting. |
+| `depends` | Plugin names that must install before this one. Omit for no dependencies. |
+| `install` | Called once during engine setup. Receives a restricted builder. May return a cleanup function. May be async (WASM loading, WebSocket connections). |
+
+### 17.2 EngineBuilder
+
+Plugins receive `EngineBuilder` — a restricted projection of `Engine` that exposes only registration APIs, not runtime controls like `start()`, `stop()`, or `dispose()`.
+
+```typescript
+interface EngineBuilder {
+  readonly world: World;
+
+  // Components — allocate SoA columns in the arena (see §18 Error Handling)
+  registerComponent(...components: Component[]): Result<void, EngineError>;
+
+  // Resources — typed singleton state
+  insertResource<T>(token: ResourceToken<T>, value: T): void;
+  getResource<T>(token: ResourceToken<T>): T;
+
+  // Events — type-safe ring-buffered channels
+  defineEvent<T>(schema?: EventSchema<T>): EventToken<T>;
+
+  // Stages — create stage, optionally with initial systems and ordering
+  addStage(name: string, systems?: SystemDef[], options?: StageOptions): void;
+
+  // Systems — add to an existing stage
+  addSystem(stage: string, ...systems: SystemDef[]): void;
+
+  // Sub-plugins — composable plugin groups
+  addPlugin(plugin: Plugin): void;
+
+  // Inline cleanup — for conditional or multi-step disposal
+  onDispose(fn: CleanupFn): void;
+}
+
+interface StageOptions {
+  after?: string;   // insert after this stage
+  before?: string;  // insert before this stage
+}
+```
+
+`Engine` implements `EngineBuilder`. During install, plugins see only the builder surface; the engine downcasts internally.
+
+### 17.3 Configurable Plugins (Factory Pattern)
+
+Most plugins accept configuration. The convention is a factory function that validates eagerly and returns a `Plugin`:
+
+```typescript
+function PhysicsPlugin(config: PhysicsConfig): Plugin {
+  // Validate config at creation time — fail fast, not at install time
+  if (config.substeps != null && (config.substeps < 1 || config.substeps > 8)) {
+    throw new Error('physics: substeps must be 1–8');
+  }
+
+  let rapierWorld: RapierWorld;
+
+  return {
+    name: 'physics',
+    depends: ['core'],
+
+    async install(app) {
+      const rapier = await import('@dimforge/rapier2d');
+      rapierWorld = rapier.World.new(config.gravity ?? { x: 0, y: 400 });
+
+      const reg = app.registerComponent(RigidBody, Collider);
+      if (!reg.ok) return reg.error;  // arena exhausted → propagate to engine
+
+      app.insertResource(PhysicsWorld, rapierWorld);
+      app.defineEvent(CollisionStart);
+      app.defineEvent(CollisionEnd);
+      app.addStage('physics', [PhysicsSyncSystem, PhysicsStepSystem], { after: 'pre-physics' });
+
+      return () => rapierWorld.free();
+    },
+  };
+}
+```
+
+Simple plugins that need no configuration can be plain objects:
+
+```typescript
+const FPSPlugin: Plugin = {
+  name: 'fps',
+  install(app) {
+    app.insertResource(FPSCounter, { frames: 0, fps: 0 });
+    app.addSystem('render-prep', FPSCounterSystem);
+  },
+};
+```
+
+### 17.4 Dependency Resolution
+
+Plugin dependencies are resolved after all `addPlugin()` calls complete (or lazily at `engine.start()`):
+
+1. **Flatten** — Collect all plugins, including sub-plugins registered via `app.addPlugin()` inside composite install functions.
+2. **Deduplicate** — Duplicate names are an error. This forces explicit intent and prevents silent config conflicts.
+3. **Graph** — Build a directed graph from `depends` arrays.
+4. **Validate** — Every dependency must exist. Cycles are a hard error.
+5. **Sort** — Topological sort yields install order.
+6. **Install** — Call each `install()` sequentially in sorted order, awaiting async installs.
+7. **Dispose** — On `engine.dispose()`, call cleanups in reverse install order.
+
+Error messages are explicit:
+
+| Condition | Error |
+|-----------|-------|
+| Duplicate name | `Plugin "physics" already installed` |
+| Missing dependency | `Plugin "gameplay" depends on "physics" which is not installed` |
+| Circular dependency | `Circular plugin dependency: physics → gameplay → physics` |
+
+### 17.5 Stage Ordering
+
+Stages use constraint-based ordering resolved via topological sort. The canonical core stages are:
+
+```
+input → worker-sync → native-sync → pre-physics → physics →
+spatial → post-physics → gameplay → render-prep
+```
+
+Plugins insert custom stages using `after` / `before` constraints:
+
+```typescript
+app.addStage('my-ai', [AIDecisionSystem, AIActionSystem], { after: 'post-physics', before: 'gameplay' });
+```
+
+Systems can also be omitted (stage-only) or added to an existing stage later:
+
+```typescript
+app.addStage('my-ai', [], { after: 'post-physics' });  // create empty stage
+app.addSystem('my-ai', AIDecisionSystem);                // add system later
+app.addSystem('gameplay', MyCustomSystem);                // add to existing stage
+```
+
+Rules:
+- Contradictory constraints produce an error with a clear message.
+- Adding systems to an existing stage via `addSystem()` is always valid.
+- Calling `addStage` with an existing name merges ordering constraints (does not recreate the stage).
+
+### 17.6 Plugin Composition
+
+A plugin can install other plugins, enabling bundle patterns:
+
+```typescript
+function DefaultPlugins(config?: {
+  renderer?: RendererConfig;
+  input?: InputConfig;
+  physics?: PhysicsConfig;
+}): Plugin {
+  return {
+    name: 'defaults',
+    install(app) {
+      app.addPlugin(RendererPlugin(config?.renderer));
+      app.addPlugin(InputPlugin(config?.input));
+      if (config?.physics) {
+        app.addPlugin(PhysicsPlugin(config.physics));
+      }
+    },
+  };
+}
+
+// One-liner setup
+engine.addPlugin(DefaultPlugins({
+  physics: { gravity: { x: 0, y: 400 } },
+}));
+```
+
+Sub-plugins participate in the same dependency resolution as top-level plugins. A composite plugin's own `depends` array is additive with its children's.
+
+### 17.7 Conditional Activation
+
+Plugins handle platform differences internally — no special framework mechanism needed:
+
+```typescript
+function NativePlugin(config: NativeConfig): Plugin {
+  return {
+    name: 'native',
+    install(app) {
+      if (typeof WebSocket === 'undefined') return;  // graceful no-op on web
+
+      const bridge = new NativeBridge(config);
+      app.insertResource(NativeBridgeToken, bridge);
+      app.addStage('native-sync', [NativeSyncSystem], { after: 'worker-sync' });
+
+      return () => bridge.close();
+    },
+  };
+}
+```
+
+When a plugin no-ops, it installs nothing — no stages, no systems, no resources. Downstream plugins that depend on its resources should check availability via `app.getResource()` or guard their own behavior.
+
+### 17.8 Hot Reload (Dev Mode)
+
+During development, plugins can be swapped without restarting the engine:
+
+```typescript
+engine.reloadPlugin(PhysicsPlugin(newConfig));
+```
+
+The reload sequence:
+1. Match existing plugin by `name`.
+2. Call old plugin's cleanup function(s).
+3. Call new plugin's `install()` — systems are replaced, resources re-inserted.
+4. Resume game loop.
+
+Component data and entity state are preserved across plugin reloads. Resource values are replaced only if the new plugin calls `insertResource` for the same token.
+
+### 17.9 Canonical Plugin Map
+
+Every `@nova/*` package that touches the engine loop exposes a plugin:
+
+| Plugin | Package | Stages | Resources | Key Components |
+|--------|---------|--------|-----------|----------------|
+| `RendererPlugin` | `@nova/renderer-webgpu` | render-prep | RenderContext | Sprite, Camera, RenderOrder |
+| `PhysicsPlugin` | `@nova/physics-rapier` | physics | PhysicsWorld | RigidBody, Collider |
+| `InputPlugin` | `@nova/input` | input | InputState | — |
+| `WorkersPlugin` | `@nova/workers` | worker-sync | WorkerPool, WorkerResultBuffer | — |
+| `NativePlugin` | `@nova/native` | native-sync | NativeBridge, NativeResultBuffer | — |
+| `StatePlugin` | `@nova/core` | — | StateStack | — |
+
+All are optional. The core engine runs with zero plugins — just a world and a game loop.
+
+### 17.10 Design Rationale
+
+**Why not classes?** A plugin is data + a function. Classes add ceremony (constructors, `this` binding, inheritance chains) without benefit. Factory functions compose naturally and close over configuration.
+
+**Why no `provides` declaration?** The `install()` function is the source of truth — it registers components, resources, events, stages, and systems directly. A separate manifest would duplicate this information and drift. Static analysis tools can introspect `install()` calls in a future pass without changing the plugin interface.
+
+**Why no plugin-to-plugin communication channel?** The ECS world is the communication channel. Resources hold shared state; events carry messages; components tag entities. A plugin bus would create a parallel universe of state outside the ECS, breaking the "single source of truth" principle.
+
+**Why no numeric ordering / priority?** Dependency declarations and stage constraints compose correctly under topological sort. Numeric priorities are fragile — they break when two independent plugins pick the same number, and they obscure intent ("why is this 50?").
+
+**Why error on duplicate names (not silently deduplicate)?** Silent deduplication hides config conflicts. If `DefaultPlugins` installs `InputPlugin()` and the user also installs `InputPlugin({ custom: true })`, the first-wins behavior silently drops the custom config. Explicit errors force deliberate choices.
+
+---
+
+## 18. Error Handling
+
+### Philosophy
+
+HyperNova avoids exceptions at runtime. After `engine.start()`, no engine API throws. Errors are values — the type system forces the designer to handle them. But this is kept tractable: **hot paths are infallible by construction**, and only seven APIs require error checking. Everything else just works.
+
+The key insight is a split between **hot paths** (per-frame, per-entity) and **boundary paths** (setup, I/O, async results):
+
+| Path | Examples | Error Model |
+|------|----------|-------------|
+| Hot | `Position.x[eid]`, `events.read()`, `events.emit()` | Cannot fail. Queries only return live entities. Ring buffers always accept writes. |
+| Boundary | `registerComponent()`, `loadManifest()`, `world.spawn()` | Returns `Result<T, EngineError>`. Caller must check. |
+| Async result | `TaskTicket`, `NativeTicket` | Status field on ticket + typed event. |
+| Frame-level | Physics budget, event ring overflow | `BudgetExceeded` event. No return value — it's an observation, not a per-call failure. |
+
+**One exception:** Plugin factory config validation (e.g., `PhysicsPlugin({ substeps: -1 })`) throws synchronously. This runs before `engine.start()` — there is no game loop to protect, and a stack trace pointing at the bad config is the most helpful response.
+
+### 18.1 Result Type
+
+```typescript
+type Result<T, E = EngineError> =
+  | { readonly ok: true;  readonly value: T }
+  | { readonly ok: false; readonly error: E };
+```
+
+TypeScript's control flow analysis narrows correctly:
+
+```typescript
+const r = app.registerComponent(Position, Velocity);
+if (!r.ok) {
+  // r.error: EngineError — must handle
+  return r.error;
+}
+// r.value: void — safe to continue
+```
+
+There is no `.unwrap()`. If the developer wants to crash, they call `engine.halt()` explicitly.
+
+Common errors are pre-allocated as frozen singletons — returning an error is a pointer copy, not a heap allocation.
+
+### 18.2 Error Codes
+
+```typescript
+const enum Err {
+  None = 0,
+
+  // 0x01xx — Fatal (engine cannot continue)
+  ArenaFull       = 0x0100,
+  MaxEntities     = 0x0101,
+  WasmInitFailed  = 0x0102,
+
+  // 0x02xx — Recoverable (operation failed, engine continues)
+  AssetNotFound       = 0x0200,
+  AssetCorrupt        = 0x0201,
+  AssetTimeout        = 0x0202,
+  BridgeDisconnected  = 0x0210,
+  BridgeCallFailed    = 0x0211,
+  WorkerTimeout       = 0x0220,
+  WorkerCrashed       = 0x0221,
+
+  // 0x03xx — Budget (performance threshold exceeded)
+  PhysicsBudgetExceeded = 0x0300,
+  SystemBudgetExceeded  = 0x0301,
+  EventRingOverflow     = 0x0302,
+
+  // 0x04xx — Validation (bad input, engine substitutes defaults)
+  InvalidConfig      = 0x0400,
+  UnknownComponent   = 0x0401,
+  StaleEntityHandle  = 0x0402,
+  SceneParseError    = 0x0403,
+}
+```
+
+### 18.3 Severity & EngineError
+
+```typescript
+const enum Severity {
+  Fatal       = 0,  // Engine cannot continue. Game loop stops.
+  Recoverable = 1,  // Operation failed but engine continues. Caller must handle.
+  Budget      = 2,  // Performance threshold exceeded. Engine adapts. Diagnostics notified.
+  Validation  = 3,  // Input data invalid. Engine substitutes defaults. Diagnostics notified.
+}
+
+interface EngineError {
+  readonly severity: Severity;
+  readonly code: Err;
+  readonly message: string;    // human-readable in dev, empty string in prod
+  readonly source?: string;    // package name: '@nova/core', '@nova/physics-rapier', etc.
+}
+```
+
+Pre-allocated singletons for common errors:
+
+```typescript
+const ERRORS = {
+  arenaFull: Object.freeze({
+    severity: Severity.Fatal,
+    code: Err.ArenaFull,
+    message: 'Component arena exhausted: maxByteLength reached',
+    source: '@nova/core',
+  }),
+  maxEntities: Object.freeze({
+    severity: Severity.Fatal,
+    code: Err.MaxEntities,
+    message: 'Maximum entity count reached',
+    source: '@nova/core',
+  }),
+  // ... one per common error
+} satisfies Record<string, EngineError>;
+```
+
+### 18.4 Error Modes
+
+The engine supports three error modes, controlling how non-fatal issues are surfaced:
+
+```typescript
+const engine = new Engine({
+  errorMode: 'lenient',    // default for `nova dev`
+  // or: 'strict'           // default for `nova build`
+  // or: 'pedantic'         // opt-in for CI/testing
+});
+```
+
+| Behavior | Lenient | Strict | Pedantic |
+|----------|---------|--------|----------|
+| Asset 404 | Use fallback, log to Diag | Use fallback, emit `EngineWarning` | `engine.halt()` |
+| Unknown component in scene | Skip, log | Skip, emit `EngineWarning` | Halt |
+| Event ring overflow | Overwrite oldest | Overwrite, emit warning | Halt |
+| Arena >90% at startup | Log | Emit warning | Halt |
+| Stale entity handle used | No-op | No-op, log to Diag | Halt |
+| Config validation (post-start) | Log, use default | Emit warning, use default | Halt |
+
+**Lenient** is for prototyping — things just work, missing assets get placeholders, the game keeps running.
+
+**Strict** is for production — fallbacks are still used, but `EngineWarning` events are emitted so game code can respond (show retry UI, degrade gracefully).
+
+**Pedantic** is for CI — any issue halts the engine. Run tests in pedantic mode to catch problems that lenient mode silently handles.
+
+### 18.5 APIs That Return Results
+
+Only these APIs require error checking. Everything else is infallible by construction:
+
+| API | Returns | Failure Reason |
+|-----|---------|----------------|
+| `app.registerComponent()` | `Result<void, EngineError>` | Arena allocation exceeded |
+| `world.spawn()` | `Result<Entity, EngineError>` | `maxEntities` reached |
+| `loadManifest()` | `Result<ManifestAssets, AssetLoadReport>` | Network/parse failures |
+| `loadScene()` | `Result<SceneHandle, AssetLoadReport>` | Network/parse/unknown component |
+| `pool.submit()` | `TaskTicket` (status field) | Pool exhausted, worker crashed |
+| `bridge.call()` | `NativeTicket` (status field) | Disconnected, timeout |
+| Plugin `install()` | `PluginResult` | WASM load failure, resource unavailable |
+
+### 18.6 Asset Error Handling
+
+Every asset type has a built-in fallback that is always valid:
+
+| Asset Type | Fallback |
+|-----------|----------|
+| Texture | 2x2 magenta/black checkerboard |
+| Audio | Silent buffer (1 sample) |
+| Tilemap | Empty tilemap (0 layers) |
+| JSON data | `{}` |
+| Font | Built-in 8x8 bitmap font |
+
+Assets expose a three-state handle:
+
+```typescript
+const enum AssetStatus {
+  Loading = 0,
+  Ready   = 1,
+  Failed  = 2,
+}
+
+interface AssetHandle<T> {
+  readonly status: AssetStatus;
+  readonly value: T | undefined;         // defined only when Ready
+  readonly error: EngineError | undefined; // defined only when Failed
+  readonly fallback: T;                   // always defined
+}
+```
+
+Systems always get usable data:
+
+```typescript
+execute({ resources }) {
+  const assets = resources.get(AssetStore);
+  const tex = assets.get('player');              // AssetHandle<Texture>
+  renderer.drawSprite(tex.value ?? tex.fallback, x, y);  // never undefined
+}
+```
+
+Asset failure events flow through the standard event system:
+
+```typescript
+const AssetLoaded = defineEvent<{ key: string; type: string }>();
+const AssetFailed = defineEvent<{ key: string; type: string; error: EngineError }>();
+```
+
+### 18.7 Diagnostics Resource
+
+The engine provides a pre-allocated ring-buffered diagnostics log:
+
+```typescript
+interface DiagnosticLog {
+  log(severity: Severity, code: Err, detail?: string): void;
+  drain(): Iterable<DiagEntry>;
+  readonly count: number;
+}
+
+interface DiagEntry {
+  readonly frame: number;
+  readonly severity: Severity;
+  readonly code: Err;
+  readonly detail: string;
+  readonly timestamp: number;   // performance.now()
+}
+```
+
+- Always available as a resource (inserted by the core engine, not a plugin).
+- Ring capacity: 256 entries (oldest overwritten). Zero allocation in steady state.
+- In production builds, `Diag.log()` is a no-op (tree-shaken). The ring buffer is not allocated.
+- Devtools drains each frame and displays entries with severity coloring.
+
+### 18.8 `engine.halt()`
+
+For fatal errors that stop the engine:
+
+```typescript
+engine.halt(error: EngineError): never;
+```
+
+1. Cancels `requestAnimationFrame` — game loop stops.
+2. Calls all registered dispose/cleanup functions in reverse plugin install order.
+3. Emits `EngineHalted` event (observable via `engine.observe()` for devtools).
+4. In dev mode, renders a diagnostic overlay on the canvas showing the error.
+5. Throws an `Error` as the final action — after all cleanup is complete. This ensures the browser devtools console shows the failure. Nothing catches it.
+
+### 18.9 Engine-Level Events
+
+```typescript
+const EngineWarning    = defineEvent<{ code: Err; message: string; source: string }>();
+const BudgetExceeded   = defineEvent<{ system: string; budget: number; actual: number; dropped: number }>();
+const AssetFailed      = defineEvent<{ key: string; type: string; error: EngineError }>();
+const BridgeDisconnected = defineEvent<{ reason: string }>();
+const BridgeReconnected  = defineEvent<{}>();
+const WorkerTimeout    = defineEvent<{ taskName: string; ticketId: number; elapsed: number }>();
+const EngineHalted     = defineEvent<{ error: EngineError }>();
+```
+
+These flow through the standard event system. In strict mode, systems can read `EngineWarning` to implement game-level error handling (retry UI, fallback behavior, etc.). In lenient mode, they are logged to `Diag` only.
+
+### 18.10 Helper Utilities
+
+```typescript
+/** Unwrap or halt — for developers who want crash-on-error */
+function must<T>(result: Result<T, EngineError>, engine: Engine): T {
+  if (result.ok) return result.value;
+  engine.halt(result.error);  // typed as `never`, so TypeScript narrows correctly
+}
+
+/** Unwrap or use default — for lenient prototyping */
+function orDefault<T>(result: Result<T, EngineError>, fallback: T): T {
+  return result.ok ? result.value : fallback;
+}
+```
+
+### 18.11 Design Rationale
+
+**Why discriminated unions, not `(value, err)` tuples?** TypeScript cannot narrow `val` based on `err === null` in destructured tuples. The `{ ok, value }` / `{ ok, error }` pattern gets correct control flow analysis.
+
+**Why no `.unwrap()`?** Unwrap reintroduces exceptions. The whole point is to avoid them. `must()` is explicit — it requires passing the engine, making the halt visible in the code.
+
+**Why events for budget warnings, not Results?** Budget issues are per-frame observations, not per-call failures. No single system "caused" the budget to be exceeded. Events are the natural broadcast mechanism.
+
+**Why pre-allocated error singletons?** Common errors are known at compile time. Returning a frozen singleton is a pointer copy — zero allocation even in error paths.
+
+**Why three error modes?** Lenient maps to rapid prototyping. Strict maps to production. Pedantic maps to CI. Three real workflows, three modes.
+
+**Why keep exceptions for plugin config?** Plugin factories run once, synchronously, before `engine.start()`. An immediate throw with a stack trace pointing at `PhysicsPlugin({ substeps: -1 })` is the fastest path to fixing the bug.
 
 ---
 

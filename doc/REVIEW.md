@@ -62,39 +62,28 @@ Strings cannot be stored in typed arrays (Float32Array, Uint32Array, etc.). The 
 Severity: High — **MITIGATED: column arrays allocated once at startup, sized to maxEntities; resize only triggered by late defineComponent(), never during gameplay**
 Line 278: "When resize() is unavailable, the arena falls back to allocate-and-copy."
 Allocating a new ArrayBuffer and copying data invalidates all existing typed array views pointing at the old buffer. Every Float32Array reference held by systems, cached by queries, or stored in component definitions becomes dangling. This is a correctness bug, not just a performance issue. The spec needs a view-invalidation strategy (e.g., indirection through a view registry, or disallowing view caching).
-8. Plugin API is Undefined
-Severity: High
-The entire architecture depends on plugins (RendererPlugin, PhysicsPlugin, InputPlugin, WorkersPlugin, NativePlugin, StatePlugin) yet the plugin interface is described only as engine.addPlugin(SomePlugin({...})). The TODO acknowledges this as an open question, but the spec should at minimum define:
+8. ~~Plugin API is Undefined~~ **RESOLVED** — See SPEC.md §17.
+Severity: High → **Resolved**
+Plugin = `{ name, depends?, install(app) }`. EngineBuilder provides restricted registration API (components, resources, events, stages, systems, sub-plugins, cleanup). Dependency resolution via topological sort. Factory pattern for configurable plugins. Hot reload in dev mode. Full rationale in §17.10.
 
-What a plugin receives (engine reference? world? lifecycle hooks?)
-Plugin ordering and dependency declaration
-How plugins register stages, systems, resources, and components
-Cleanup/dispose lifecycle
-
-9. No Error Handling Strategy
-Severity: Medium
-The spec doesn't address failure modes:
-
-Arena hits maxByteLength — what happens? Silent failure? Exception? Graceful degradation?
-Asset loading fails (404, network timeout, corrupt file)
-WebSocket disconnects for @nova/native mid-operation
-Worker task exceeds timeout — the spec says "terminated and replaced," but what about in-flight state?
-Physics step exceeds frame budget — does the game loop skip steps? Accumulate debt?
+9. ~~No Error Handling Strategy~~ **RESOLVED** — See SPEC.md §18.
+Severity: Medium → **Resolved**
+Comprehensive error handling strategy added: `Result<T, EngineError>` discriminated union at boundary APIs, three error modes (lenient/strict/pedantic), pre-allocated error singletons, `Diag` resource, `engine.halt()` for fatal errors. Per-problem resolutions: arena overflow returns `Result` from `registerComponent()`, assets use `AssetHandle<T>` with fallbacks, native bridge auto-reconnects with `'disconnected'` ticket status, worker timeouts documented with buffer loss semantics, physics accumulator capped via `maxSubstepsPerFrame` with `BudgetExceeded` events. Plugin factories remain the one place exceptions are allowed (before engine start).
 
 10. No Save/Load Game Strategy
-Severity: Medium
-For a game engine, save/load is fundamental. The spec discusses snapshot serialization for networking (@nova/net) but never addresses game save/load to persistent storage. On web, this means IndexedDB; on local target, filesystem via @nova/native. The networking serializer could serve double duty, but this isn't stated.
+Severity: Medium → **Resolved**
+`@nova/persist` added as an opt-in plugin (SPEC.md §9.5). Uses SQLite as a continuously-mirrored shadow of the SoA arena — typed array columns stored as BLOBs with zero serialization (`memcpy` in, `memcpy` out). Save = snapshot current live state (O(columns), not O(entities)). Load = restore snapshot BLOBs into typed arrays + invalidate query caches. Background sync via `defineJob` worker flushes dirty columns every N seconds. Crash recovery via live DB state. Cross-platform drivers: `better-sqlite3` (local), `wa-sqlite` + OPFS (web), `@libsql/client` for Turso cloud saves. Components persist by default; opt out via `{ persist: false }`. Resources opt in explicitly. Time-travel debugging (devtools only) reuses `@nova/net`'s change bitmask diff format.
 11. Scene File Format Lacks Versioning
 Severity: Medium
 .nova.json files (lines 1456–1486) have no version field. As the engine evolves, scene files will need migration. Without versioning, there's no way to detect which format version a file uses or apply transformations.
 12. Prefab Composition/Inheritance
-Severity: Low
+Severity: Low — **RESOLVED: prefabs support single inheritance via `extends` and multi-prefab composition via `includes`. Merge semantics are deterministic: base (recursive) → includes (left-to-right) → own declarations. Children merge by name. Component removal intentionally unsupported. Resolution at `definePrefab()` time with circular reference detection. Scene files unchanged — overrides computed against the resolved (flattened) prefab. `childOverrides` added for per-instance child component overrides. See SPEC.md §12.**
 Prefabs can have children, but can prefabs extend other prefabs? A BossPrefab based on EnemyPrefab with overrides is a common pattern. The spec doesn't address prefab inheritance or composition beyond parent-child hierarchy.
 13. Render Order Management
 Severity: Low
 The render pipeline (line 607) sorts by "layer → texture → blend mode → depth" but there's no dedicated render-order component or API. The scene file example shows a RenderOrder: { layer: -10 } component, but this component is never defined in the spec. How developers control draw order (z-index equivalent) is underspecified.
 14. State System vs. Global Systems Interaction
-Severity: Medium
+Severity: Medium — **RESOLVED: resource-guard model; all systems global, state-aware systems guard on `StateStack` resource; `defineState` is lifecycle + scene only, no `systems` field. See SPEC.md §14.**
 defineState (line 1660) includes a systems array. But globally-registered systems (via engine.addStage) presumably run in all states. The spec doesn't explain:
 
 Do state systems replace global systems, or add to them?
@@ -108,11 +97,11 @@ Severity: High — **ELIMINATED: archetypes are bitmasks for query resolution, n
 The spec doesn't discuss archetype fragmentation. Every unique combination of components creates a new archetype. If entities frequently gain/lose components (e.g., buff/debuff systems adding tag components), the number of archetypes can explode. Each archetype has its own set of typed arrays, defeating cache locality benefits. Games with rich component compositions can easily reach hundreds of archetypes, each containing only a few entities.
 Mitigation strategies (archetype merging, component grouping guidelines, archetype count limits) aren't discussed.
 16. Spatial Index Staleness
-Severity: High
+Severity: High — **RESOLVED: SpatialIndexSystem moved to dedicated `spatial` stage immediately after `physics`; post-physics, gameplay, and render-prep all see current-frame spatial data**
 SpatialIndexSystem runs in render-prep (line 1733) — after all gameplay stages. But spatial queries are commonly needed during gameplay (AI proximity checks, area-of-effect damage, trigger zones). Systems in pre-physics, physics, post-physics, and gameplay stages would all query stale spatial data from the previous frame. For fast-moving objects, this means missed queries and phantom results.
 The spatial index should be updated at least once before gameplay systems run (e.g., in a spatial-update stage before pre-physics), or provide a way for systems to trigger incremental updates.
 17. Change Detection Overhead
-Severity: Medium
+Severity: Medium — **RESOLVED: double-buffered snapshot comparison for `.changed()` queries. Per-entity precision with zero write-path impact. Snapshots allocated only for components referenced in `.changed()` queries (opt-in cost). Scheduler write-set serves as free coarse pre-filter. Comparison is O(matched entities), not O(maxEntities). Snapshot copy at frame end is a single memcpy per tracked field (~0.02ms per 200KB). Comparison utility shared with `@nova/net` delta compression and `@nova/devtools` time-travel debugging.**
 The query API supports .changed(Health) (line 199) for change detection. In SoA storage, this requires tracking every write to every component field — typically via dirty bitfields per entity per component, checked on every Position.x[eid] = ... assignment. Since component fields are raw typed array elements, there's no setter to intercept writes. This means either:
 
 A Proxy-based approach (expensive, defeats the typed array performance model)
@@ -144,5 +133,5 @@ Line 598: "WebGPU availability (as of 2025) is strong on Chrome and Edge, growin
 The @nova/core package includes: ECS world, archetype storage, generational IDs, entity hierarchy, system scheduler with dependency-graph analysis, game loop, event bus, math library (Vec2, Mat3, AABB, Color + utilities), typed resources, scene loading, prefab instantiation, AND spatial index — all under 20 KB gzipped. For reference, bitecs (SoA-only, no scheduler/math/scenes) is ~5 KB. The target may be achievable but should be validated with a prototype before committing to it as a published target.
 
 Summary by Severity
-SeverityCountKey ItemsCritical0~~Entity ID vs. archetype SoA access pattern (#1)~~ — RESOLVEDHigh3~~Entity bit packing (#2)~~ RESOLVED, ~~string types in SoA (#6)~~ RESOLVED, ~~arena fallback (#7)~~ MITIGATED, plugin API (#8), ~~archetype fragmentation (#15)~~ ELIMINATED, spatial index staleness (#16)Medium6~~Event API inconsistency (#3)~~ RESOLVED, resource access (#4), error handling (#9), save/load (#10), scene versioning (#11), state system interaction (#14), change detection (#17), ~~zero-alloc events (#18)~~ RESOLVED, ~~query overhead (#19)~~ SIMPLIFIEDLow6Stage ordering (#5), prefab inheritance (#12), render order (#13), transform propagation (#20), tilemap claim (#21), minor issues (#22–25)
-The adoption of global SoA (column-per-field) storage with archetype bitmask query resolution resolves issues #1, #2, #7, #15, and #19. The unified `defineEvent` API with ring-buffered storage resolves issues #3 and #18. String interning via global StringTable resolves issue #6. The remaining highest-priority issues are: plugin API (#8) and spatial index staleness (#16).
+SeverityCountKey ItemsCritical0~~Entity ID vs. archetype SoA access pattern (#1)~~ — RESOLVEDHigh3~~Entity bit packing (#2)~~ RESOLVED, ~~string types in SoA (#6)~~ RESOLVED, ~~arena fallback (#7)~~ MITIGATED, plugin API (#8), ~~archetype fragmentation (#15)~~ ELIMINATED, spatial index staleness (#16)Medium6~~Event API inconsistency (#3)~~ RESOLVED, resource access (#4), ~~error handling (#9)~~ RESOLVED, save/load (#10), scene versioning (#11), ~~state system interaction (#14)~~ RESOLVED, change detection (#17), ~~zero-alloc events (#18)~~ RESOLVED, ~~query overhead (#19)~~ SIMPLIFIEDLow6Stage ordering (#5), prefab inheritance (#12), render order (#13), transform propagation (#20), tilemap claim (#21), minor issues (#22–25)
+The adoption of global SoA (column-per-field) storage with archetype bitmask query resolution resolves issues #1, #2, #7, #15, and #19. The unified `defineEvent` API with ring-buffered storage resolves issues #3 and #18. String interning via global StringTable resolves issue #6. Error handling strategy (§18) resolves issue #9. The resource-guard state model (systems check `StateStack` resource, no per-state system injection) resolves issue #14. The remaining highest-priority issues are: plugin API (#8) and spatial index staleness (#16).
