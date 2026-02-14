@@ -53,7 +53,7 @@ While these are additive (plugins add stages), the spec should present a single 
 
 Gaps (Underspecified or Missing)
 6. String Component Types in SoA Storage
-Severity: High
+Severity: High — **RESOLVED: string interning via global StringTable; Types.string fields backed by Uint32Array storing intern indices; index 0 reserved for empty; string resolution deferred to point-of-use**
 Scene metadata components (line 1513–1519) use Types.string:
 typescriptconst Name = defineComponent({ value: Types.string });
 const SceneEntity = defineComponent({ sceneId: Types.string, entityIndex: Types.u32 });
@@ -144,5 +144,5 @@ Line 598: "WebGPU availability (as of 2025) is strong on Chrome and Edge, growin
 The @nova/core package includes: ECS world, archetype storage, generational IDs, entity hierarchy, system scheduler with dependency-graph analysis, game loop, event bus, math library (Vec2, Mat3, AABB, Color + utilities), typed resources, scene loading, prefab instantiation, AND spatial index — all under 20 KB gzipped. For reference, bitecs (SoA-only, no scheduler/math/scenes) is ~5 KB. The target may be achievable but should be validated with a prototype before committing to it as a published target.
 
 Summary by Severity
-SeverityCountKey ItemsCritical0~~Entity ID vs. archetype SoA access pattern (#1)~~ — RESOLVEDHigh3~~Entity bit packing (#2)~~ RESOLVED, string types in SoA (#6), ~~arena fallback (#7)~~ MITIGATED, plugin API (#8), ~~archetype fragmentation (#15)~~ ELIMINATED, spatial index staleness (#16)Medium6~~Event API inconsistency (#3)~~ RESOLVED, resource access (#4), error handling (#9), save/load (#10), scene versioning (#11), state system interaction (#14), change detection (#17), ~~zero-alloc events (#18)~~ RESOLVED, ~~query overhead (#19)~~ SIMPLIFIEDLow6Stage ordering (#5), prefab inheritance (#12), render order (#13), transform propagation (#20), tilemap claim (#21), minor issues (#22–25)
-The adoption of global SoA (column-per-field) storage with archetype bitmask query resolution resolves issues #1, #2, #7, #15, and #19. The unified `defineEvent` API with ring-buffered storage resolves issues #3 and #18. The remaining highest-priority issues are: string types in SoA (#6), plugin API (#8), and spatial index staleness (#16).
+SeverityCountKey ItemsCritical0~~Entity ID vs. archetype SoA access pattern (#1)~~ — RESOLVEDHigh3~~Entity bit packing (#2)~~ RESOLVED, ~~string types in SoA (#6)~~ RESOLVED, ~~arena fallback (#7)~~ MITIGATED, plugin API (#8), ~~archetype fragmentation (#15)~~ ELIMINATED, spatial index staleness (#16)Medium6~~Event API inconsistency (#3)~~ RESOLVED, resource access (#4), error handling (#9), save/load (#10), scene versioning (#11), state system interaction (#14), change detection (#17), ~~zero-alloc events (#18)~~ RESOLVED, ~~query overhead (#19)~~ SIMPLIFIEDLow6Stage ordering (#5), prefab inheritance (#12), render order (#13), transform propagation (#20), tilemap claim (#21), minor issues (#22–25)
+The adoption of global SoA (column-per-field) storage with archetype bitmask query resolution resolves issues #1, #2, #7, #15, and #19. The unified `defineEvent` API with ring-buffered storage resolves issues #3 and #18. String interning via global StringTable resolves issue #6. The remaining highest-priority issues are: plugin API (#8) and spatial index staleness (#16).
