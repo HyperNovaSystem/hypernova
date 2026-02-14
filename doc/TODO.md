@@ -52,7 +52,6 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 | Events | `mitt` (1.5M/wk) | Add ~50-line typed wrapper for discriminated-union narrowing. Not a separate package. |
 
 
-
 # Implementation Priorities
 
 ## Phase 1 — Core ECS + Renderer (foundation)
@@ -91,7 +90,37 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 - [ ] `@nova/ui`: Layout engine, widgets, interaction
 - [ ] `@nova/net`: Snapshot serialization, clock sync
 - [ ] `@nova/workers`: Worker pool, jobs, streams
+- [ ] `@nova/native`: `defineNativeService` / `defineNativeClient` APIs + typed wire protocol
+- [ ] `@nova/native`: WebSocket bridge (server-side ServiceRegistry + client-side NativeBridge resource)
+- [ ] `@nova/native`: `NativeSyncSystem`, `NativeResultBuffer`, ECS event integration (`native:result`, `native:event`)
+- [ ] `@nova/native`: `NativePlugin` registration + graceful degradation on web target
 - [ ] `@nova/renderer-webgpu`: WebGL2 fallback backend
+
+## Phase 5 — Packaging & Distribution
+
+Depends on Phase 1 (core + renderer) and Phase 3 (CLI). See SPEC.md §16.
+
+### Web target (`nova export --target web`)
+- [ ] Static deployment bundle with asset manifest
+- [ ] Generate COOP/COEP header configs (`_headers`, `.htaccess`, console snippets for Nginx/Caddy)
+- [ ] `--pwa` flag: service worker + `manifest.webmanifest` generation
+- [ ] `--zip` flag: itch.io-ready zip with `index.html` at root
+
+### Local server target (`nova export --target local`)
+- [ ] Embedded HTTP + WebSocket server (~240 lines: `node:http` + `ws`, MIME map, COOP/COEP headers, SPA fallback, `/__nova` WebSocket endpoint)
+- [ ] `@nova/native` server integration: ServiceRegistry, native service loading from `nova.config.ts`
+- [ ] Node.js SEA build pipeline (enumerate dist/, generate sea-config, `node --build-sea`)
+- [ ] Native addon collection: walk require tree for `.node` files, copy to `addons/`, rewrite require paths
+- [ ] `prebuild-install` integration for prebuilt native binaries, `node-gyp` fallback
+- [ ] Port probe (find free port from 7700), browser launch (platform-specific), graceful shutdown
+- [ ] Optional `rcedit` step for custom `.exe` icon on Windows
+
+### Shared
+- [ ] `@nova/vite-plugin`: Ensure `base: './'` (relative asset paths) in production builds
+- [ ] `@nova/vite-plugin`: WASM loader fallback from `instantiateStreaming` to `instantiate(arrayBuffer)`
+- [ ] Export configuration schema in `nova.config.ts` (name, icon, width, height, per-target options)
+- [ ] `--out`, `--name`, `--icon`, `--platform` CLI flags
+- [ ] Cross-platform build testing (Windows, macOS, Linux)
 
 
 # Open Questions

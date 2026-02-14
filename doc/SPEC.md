@@ -19,10 +19,10 @@ HyperNova is designed around three core principles:
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                         Game Loop                            │
-│  ┌──────────┐  ┌────────────────────────┐  ┌──────────────┐ │
-│  │  Input   │  │     Fixed Update       │  │   Render     │ │
-│  │  Gather  │→ │  ┌──────────────────┐  │→ │ (interpolated│ │
-│  └──────────┘  │  │ Stage: pre-phys  │  │  └──────────────┘ │
+│  ┌──────────┐  ┌────────────────────────┐  ┌───────────────┐ │
+│  │  Input   │  │     Fixed Update       │  │   Render      │ │
+│  │  Gather  │-→│  ┌──────────────────┐  │-→│ (interpolated │ │
+│  └──────────┘  │  │ Stage: pre-phys  │  │  └───────────────┘ │
 │                │  │  Batch 0: A, B   │  │                    │
 │                │  │  Batch 1: C      │  │                    │
 │                │  └──────────────────┘  │                    │
@@ -34,22 +34,22 @@ HyperNova is designed around three core principles:
 └──────────────────────────────────────────────────────────────┘
         │               │                        │
         ▼               ▼                        ▼
-┌──────────────────────────────────────────────────────────────┐
-│                        ECS World                              │
-│                                                               │
-│  Entities:    [0, 1, 2, 3, 4, ...]                            │
-│  Components:  Position | Velocity | Sprite | ...  (SoA)      │
-│  Systems:     MovementSystem → PhysicsSystem → ...            │
-│                                                               │
-│  Queries:     world.query(Position, Velocity)                 │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                        ECS World                         │
+│                                                          │
+│  Entities:    [0, 1, 2, 3, 4, ...]                       │
+│  Components:  Position | Velocity | Sprite | ...  (SoA)  │
+│  Systems:     MovementSystem → PhysicsSystem → ...       │
+│                                                          │
+│  Queries:     world.query(Position, Velocity)            │
+└──────────────────────────────────────────────────────────┘
         │               │                │
         ▼               ▼                ▼
-┌────────────┐  ┌──────────────┐  ┌────────────────┐
-│  @nova/    │  │  @nova/      │  │  @nova/        │
-│  input     │  │  physics-    │  │  renderer-     │
-│            │  │  rapier      │  │  webgpu        │
-└────────────┘  └──────────────┘  └────────────────┘
+ ┌────────────┐  ┌──────────────┐  ┌──────────────┐
+ │  @nova/    │  │  @nova/      │  │  @nova/      │
+ │  input     │  │  physics-    │  │  renderer-   │
+ │            │  │  rapier      │  │  webgpu      │
+ └────────────┘  └──────────────┘  └──────────────┘
 ```
 
 ### Game Loop
@@ -80,6 +80,7 @@ Packages communicate through the ECS world and well-defined interfaces. No packa
   ├── @nova/ui              — In-game UI (layout, widgets, interaction)
   ├── @nova/net             — Networking primitives
   ├── @nova/workers         — Background worker pool & services
+  ├── @nova/native          — Native module bridge (local target only)
   └── @nova/devtools        — Inspector, profiler, visual editor
 ```
 
@@ -1062,6 +1063,289 @@ Cleanup (worker termination) is registered on engine dispose.
 
 ---
 
+## 10.5 Native Module Bridge (`@nova/native`)
+
+### Overview
+
+The local exe target (§16.2) runs a Node.js server process that serves the game to the user's browser. Game code executes in browser context and has no access to Node.js APIs or native modules. `@nova/native` bridges this gap — it provides a typed WebSocket bridge between browser game code and native Node.js modules running in the server process.
+
+This enables use cases that require hardware or OS access: serial ports (`serialport`), GPIO, USB HID devices, native filesystem, spawning child processes, and any other Node.js native addon.
+
+`@nova/native` is only active on the local target. On the web target it degrades gracefully — game code runs identically but native services are unavailable.
+
+### Architecture
+
+```
+Browser (game code)                          Node.js Server (SEA)
+───────────────────                          ────────────────────
+@nova/native client                          @nova/native/server
+  NativeBridge resource                        ServiceRegistry
+  NativeResultBuffer                             ├── SerialService
+  NativeSyncSystem                               ├── FileSystemService
+       │                                         └── ... user services
+       │         WebSocket (ws://127.0.0.1/__nova)
+       └────────────────────────────────────────►┘
+           ← native:result (request/response)
+           ← native:event  (streaming data)
+           → call(service, method, args)
+```
+
+The WebSocket endpoint is `/__nova` on the same port as the HTTP server — no additional ports needed. The `ws` library (pure JS, ~25 KB, no native dependencies) handles WebSocket framing on the server side.
+
+### Defining Native Services (Server-Side)
+
+Native services are defined in separate modules and registered with the embedded server. They follow the engine's `define*` naming convention.
+
+```typescript
+// services/serial.service.ts — runs in Node.js
+import { defineNativeService } from '@nova/native/server';
+
+export const SerialService = defineNativeService({
+  name: 'serial',
+
+  // Service state, created once on startup
+  init: () => ({
+    ports: new Map<string, SerialPort>(),
+  }),
+
+  // Methods callable from game code (request → response)
+  methods: {
+    async list(state) {
+      const { SerialPort } = await import('serialport');
+      return SerialPort.list();
+    },
+
+    async open(state, args: { path: string; baudRate: number }, emit) {
+      const { SerialPort, ReadlineParser } = await import('serialport');
+      const port = new SerialPort({ path: args.path, baudRate: args.baudRate });
+      const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
+
+      // Streaming: native data → game events via emit()
+      parser.on('data', (line: string) => {
+        emit('data', { path: args.path, line });
+      });
+
+      port.on('close', () => {
+        emit('close', { path: args.path });
+        state.ports.delete(args.path);
+      });
+
+      state.ports.set(args.path, port);
+      return { path: args.path, opened: true };
+    },
+
+    async write(state, args: { path: string; bytes: Uint8Array }) {
+      const port = state.ports.get(args.path);
+      if (!port) throw new Error(`Port ${args.path} not open`);
+      port.write(Buffer.from(args.bytes));
+      return { written: args.bytes.length };
+    },
+
+    async close(state, args: { path: string }) {
+      const port = state.ports.get(args.path);
+      if (!port) throw new Error(`Port ${args.path} not open`);
+      port.close();
+      state.ports.delete(args.path);
+      return { closed: true };
+    },
+  },
+
+  // Cleanup on server shutdown
+  dispose(state) {
+    for (const port of state.ports.values()) port.close();
+  },
+});
+```
+
+**Key design points:**
+- Methods are `async` on the server side. The async boundary is hidden from game code by the bridge.
+- The `emit(event, data)` callback pushes unsolicited events to the browser — this is how continuous data sources (serial input, sensor readings, file watchers) stream into the game.
+- `init()`/`dispose()` manage native resource lifecycles. `dispose` runs on `SIGINT`/`SIGTERM`.
+- Dynamic `import()` for native modules avoids errors when the service definition is loaded in a non-Node.js context (e.g., during type-checking).
+
+Services are configured in `nova.config.ts`:
+
+```typescript
+export default {
+  export: {
+    local: {
+      native: {
+        services: ['./services/serial.service'],
+      },
+    },
+  },
+};
+```
+
+### Consuming Native Services (Client-Side)
+
+Game code uses typed clients that mirror the server service shape.
+
+```typescript
+// Runs in browser context
+import { defineNativeClient } from '@nova/native';
+import type { SerialService } from '../services/serial.service';
+
+const Serial = defineNativeClient<typeof SerialService>({
+  name: 'serial',  // must match server-side service name
+});
+```
+
+`defineNativeClient` produces a client handle used with the `NativeBridge` resource. Calls return a `NativeTicket` — not a Promise. This matches the `TaskTicket` pattern from `@nova/workers` and prevents `await` inside system `execute` functions.
+
+```typescript
+interface NativeTicket<T> {
+  readonly id: number;
+  readonly service: string;
+  readonly method: string;
+  readonly status: 'pending' | 'resolved' | 'rejected';
+  // Not a Promise — no .then(), no await
+}
+```
+
+### ECS Integration
+
+Results from native services flow through the same pattern as worker results:
+
+1. The WebSocket `onmessage` handler pushes incoming data into the `NativeResultBuffer` resource.
+2. The `NativeSyncSystem` drains the buffer during the `native-sync` stage.
+3. Each result is emitted as a `native:result` or `native:event` on the typed event bus.
+4. Game systems subscribe to these events and apply data to components.
+
+**Event types:**
+
+```typescript
+// Request/response result (correlatable via id)
+type NativeResultEvent = {
+  type: 'native:result';
+  id: number;            // ticket correlation ID
+  service: string;
+  method: string;
+  ok: boolean;
+  data?: unknown;
+  error?: string;
+};
+
+// Unsolicited streaming event (no correlation ID)
+type NativeStreamEvent = {
+  type: 'native:event';
+  service: string;
+  event: string;         // event name within the service
+  data: unknown;
+};
+```
+
+**Stage ordering:**
+
+```typescript
+engine.addStage('input',        [InputGatherSystem]);
+engine.addStage('worker-sync',  [WorkerSyncSystem]);
+engine.addStage('native-sync',  [NativeSyncSystem]);
+engine.addStage('pre-physics',  [MovementSystem, AISystem, ApplySerialDataSystem]);
+// ... remaining stages
+```
+
+The `native-sync` stage runs after `worker-sync` and before gameplay systems. Native calls submitted during gameplay are processed by the server between frames and consumed at the start of the next frame's `native-sync` stage.
+
+For high-frequency data (e.g., serial port at 115200 baud), multiple events may accumulate per frame. All are delivered as a single batch during `native-sync`, giving systems a deterministic set to process.
+
+### Graceful Degradation
+
+On the web target (no Node.js server), `@nova/native` installs but operates in stub mode:
+
+- `NativeBridge.available` is `false`
+- `call()` returns an immediately-rejected `NativeTicket` with error `'Native services unavailable in web target'`
+- `NativeSyncSystem` runs but finds an empty buffer — zero cost
+- No WebSocket connection is attempted
+
+Game code guards with an availability check:
+
+```typescript
+execute({ resources }) {
+  const bridge = resources.get(NativeBridge);
+  if (!bridge.available) return;
+  // ... native operations
+}
+```
+
+This matches the graceful degradation pattern from `@nova/workers` (§10): game code behaves identically regardless of native service availability.
+
+### Wire Protocol
+
+Control messages use JSON text frames:
+
+```typescript
+// Client → Server
+{ id: number; service: string; method: string; payload: unknown }
+
+// Server → Client (response)
+{ id: number; ok: boolean; data?: unknown; error?: string }
+
+// Server → Client (streaming event, unsolicited)
+{ id: 0; service: string; event: string; data: unknown }
+```
+
+Binary data (high-frequency byte streams) uses WebSocket binary frames with a 4-byte header: `[service_id: u16][event_id: u16][payload: Uint8Array]`. Service and event IDs are negotiated during the handshake.
+
+### Plugin
+
+```typescript
+import { NativePlugin, defineNativeClient } from '@nova/native';
+
+engine.addPlugin(NativePlugin({
+  clients: [Serial, GPIO],
+}));
+```
+
+The plugin creates the `NativeBridge` resource, `NativeResultBuffer` resource, attempts WebSocket connection (skipped on web target), and inserts the `native-sync` stage. Cleanup (WebSocket close) is registered on engine dispose.
+
+### Example: Serial Port Game Controller
+
+A serial-connected Arduino sends joystick data, game code reads it as component data.
+
+```typescript
+import { defineComponent, defineSystem, query, Types } from '@nova/core';
+import { NativePlugin, defineNativeClient, NativeBridge } from '@nova/native';
+import type { SerialService } from '../services/serial.service';
+
+const Serial = defineNativeClient<typeof SerialService>({ name: 'serial' });
+
+const SerialJoystick = defineComponent({ x: Types.f32, y: Types.f32 });
+const SerialConnected = defineComponent({});
+
+const SerialConnectSystem = defineSystem({
+  name: 'SerialConnect',
+  query: query(SerialJoystick).not(SerialConnected),
+  resources: { read: [NativeBridge] },
+  execute({ entities, resources, commands }) {
+    const bridge = resources.get(NativeBridge);
+    if (!bridge.available) return;
+    for (const eid of entities) {
+      bridge.call(Serial, 'open', { path: 'COM3', baudRate: 9600 });
+      commands.add(eid, SerialConnected, {});
+    }
+  },
+});
+
+const SerialDataSystem = defineSystem({
+  name: 'SerialData',
+  query: query(SerialJoystick, SerialConnected),
+  events: ['native:event'],
+  execute({ entities, events }) {
+    for (const event of events.get('native:event')) {
+      if (event.service !== 'serial' || event.event !== 'data') continue;
+      const [x, y] = event.data.line.split(',').map(Number);
+      for (const eid of entities) {
+        SerialJoystick.x[eid] = x;
+        SerialJoystick.y[eid] = y;
+      }
+    }
+  },
+});
+```
+
+---
+
 ## 11. Developer Experience
 
 ### Hot Module Replacement
@@ -1103,12 +1387,18 @@ The devtools panel is an HTML overlay activated with a keybind (`` ` `` by defau
 ### CLI
 
 ```bash
-npx nova create my-game          # scaffold a new project
-npx nova add physics-rapier      # add a package
-npx nova dev                     # start dev server with HMR + visual editor
-npx nova build                   # production build (tree-shaken, devtools stripped)
-npx nova export --target electron # package as desktop app
+npx nova create my-game              # scaffold a new project
+npx nova add physics-rapier          # add a package
+npx nova dev                         # start dev server with HMR + visual editor
+npx nova build                       # production build (tree-shaken, devtools stripped)
+npx nova export                      # export for web (default)
+npx nova export --target web         # static build for self-hosting
+npx nova export --target web --pwa   # + service worker + manifest (installable, offline)
+npx nova export --target web --zip   # .zip for itch.io upload
+npx nova export --target local       # standalone .exe with embedded server + native bridge
 ```
+
+The `export` command is detailed in §16 (Packaging & Distribution).
 
 ---
 
@@ -1441,6 +1731,171 @@ const nearby = spatial.query(new AABB(x - 100, y - 100, x + 100, y + 100));
 ```
 
 The spatial index is automatically maintained by a `SpatialIndexSystem` that runs in `render-prep`. It reads `Position` and optionally `AABB`/`Collider` for bounds.
+
+---
+
+## 16. Packaging & Distribution
+
+HyperNova games are browser-first, but distribution needs vary. The `nova export` command provides two targets that both consume the same Vite production build:
+
+```
+nova build (Vite production)
+     │
+     ▼
+  dist/  (static HTML/JS/CSS/WASM/assets)
+     │
+     ├──▶  --target web        → deploy-ready static bundle
+     └──▶  --target local      → standalone .exe with embedded server + native bridge
+```
+
+### 16.1 Web Target (Default)
+
+`nova export --target web` produces a self-contained static directory for deployment to any HTTP server or hosting platform.
+
+**Output:**
+```
+dist/
+  index.html
+  assets/
+    main-[hash].js          # tree-shaken, minified
+    main-[hash].css
+    rapier_bg-[hash].wasm   # if @nova/physics-rapier used
+    images/
+    audio/
+  manifest.json             # asset manifest for preloading
+  _headers                  # Netlify header config
+  .htaccess                 # Apache header config
+```
+
+**Hosting requirements:**
+- HTTPS (required for WebGPU — all major hosting platforms provide this)
+- `.wasm` served with `Content-Type: application/wasm`
+- For `SharedArrayBuffer` support (`@nova/workers`), the server must send:
+  - `Cross-Origin-Opener-Policy: same-origin`
+  - `Cross-Origin-Embedder-Policy: require-corp`
+
+The export generates `_headers` (Netlify format) and `.htaccess` (Apache) with the correct COOP/COEP headers. Nginx and Caddy snippets are printed to the console.
+
+**PWA mode** (`nova export --target web --pwa`):
+- Generates `manifest.webmanifest` with game name, icons, `display: fullscreen`, theme color
+- Generates a service worker that precaches all assets from the manifest
+- Game becomes installable via browser's "Install App" prompt
+- Fully offline-capable after first visit
+
+**itch.io mode** (`nova export --target web --zip`):
+- Produces a `.zip` with `index.html` at root (itch.io requirement)
+- All asset paths relative
+
+### 16.2 Local Server Target (Standalone Executable)
+
+`nova export --target local` produces a single executable that embeds the game files and a minimal HTTP server. On launch it serves the game on localhost and opens the user's default browser.
+
+**Technology:** Node.js Single Executable Application (SEA), built into Node.js 20+. The entire dist directory and a ~240-line server (HTTP + WebSocket) are embedded into the Node.js binary via `sea.getRawAsset()`.
+
+**Runtime behavior:**
+1. Probe for a free port starting at 7700 (sequential scan, `127.0.0.1` only)
+2. Start `node:http` serving embedded assets with correct MIME types and COOP/COEP headers
+3. Initialize the `@nova/native` service registry and load configured native services
+4. Listen for WebSocket upgrade on `/__nova` for the native module bridge
+5. Open the default browser to `http://127.0.0.1:{port}`
+6. Console displays: `Game running at http://127.0.0.1:7700 — press Ctrl+C to quit`
+7. Graceful shutdown on `SIGINT`/`SIGTERM` (calls `dispose()` on all native services)
+
+**Embedded server details:**
+- Raw `node:http` + `ws` (pure JS WebSocket library, ~25 KB, no native dependencies)
+- MIME type map covers `.html`, `.js`, `.css`, `.wasm`, `.png`, `.jpg`, `.webp`, `.avif`, `.ogg`, `.mp3`, `.wav`, `.json`
+- `.wasm` → `application/wasm` (required for `WebAssembly.instantiateStreaming`)
+- COOP/COEP headers on all responses (enables `SharedArrayBuffer`)
+- SPA fallback: unknown routes serve `index.html`
+- WebSocket on `/__nova`: native service bridge for `@nova/native` (see §10.5)
+
+**Native module support:** When the game uses `@nova/native` services (§10.5), the server loads the configured service modules and routes WebSocket messages to them. Native Node.js addons (`.node` files compiled from C/C++) cannot be embedded in the SEA blob — they are shipped in an `addons/` directory alongside the executable. The server resolves native module `require()` calls relative to the executable's directory.
+
+**WebGPU:** `127.0.0.1` is a secure context in all browsers — WebGPU works without HTTPS.
+
+**Build process:**
+1. Run `nova build` (Vite production)
+2. Bundle server script to single CJS file via esbuild (native addon requires marked as external)
+3. Collect native addon `.node` files into `addons/` (via `prebuild-install` for prebuilt binaries, `node-gyp` fallback)
+4. Rewrite native module require paths to resolve relative to the executable
+5. Generate SEA config (enumerate all files in `dist/`, map to asset keys)
+6. Run `node --build-sea` to produce the executable
+7. (Optional) `rcedit` to set custom icon on Windows
+
+**Output:**
+```
+release/
+  mygame.exe              # SEA binary (game + server embedded)
+  addons/                 # native addon files (only if @nova/native used)
+    serialport.node
+    other-binding.node
+```
+
+**Binary size:** ~50–75 MB (Node.js binary ~50 MB + game assets). Compressed: ~25–40 MB. Native addons add their own size (typically 1–5 MB each).
+
+**Limitations:**
+- Must build on each target platform (Node.js SEA does not cross-compile; native addons likewise)
+- WebGPU availability depends on user's installed browser
+- Native addons must be shipped alongside the exe, not embedded (the `addons/` directory must be distributed with the binary)
+- No system tray in v1 (console window only)
+- Custom `.exe` icon requires post-processing with `rcedit`
+
+### 16.3 Export Configuration
+
+```typescript
+// nova.config.ts
+export default {
+  name: 'My Game',
+  width: 800,
+  height: 600,
+  icon: './assets/icon.png',
+
+  export: {
+    web: {
+      pwa: false,       // generate service worker + manifest
+      zip: false,       // produce itch.io zip
+    },
+    local: {
+      port: 7700,       // preferred starting port
+      openBrowser: true, // auto-open browser on launch
+      native: {         // @nova/native service configuration (optional)
+        services: ['./services/serial.service'],
+      },
+    },
+  },
+};
+```
+
+**CLI flags:**
+```bash
+nova export --target <web|local>
+            --out ./release          # output directory
+            --name "My Game"         # executable/app name
+            --icon ./icon.png        # app icon
+            --pwa                    # web only: enable PWA
+            --zip                    # web only: produce zip
+            --platform <win32|darwin|linux>  # local: target OS
+```
+
+### 16.4 Vite Plugin Requirements
+
+For all export targets to work correctly, `@nova/vite-plugin` must:
+- Set `base: './'` (relative paths) in production builds — relative paths are required for the local target's embedded server
+- Emit a WASM loader that falls back to `WebAssembly.instantiate(arrayBuffer)` when `instantiateStreaming` fails (handles missing MIME type gracefully)
+
+### 16.5 Comparison
+
+| Dimension | Web | Local (.exe) |
+|---|---|---|
+| Output size | Game only | ~50–75 MB |
+| Distribution | URL | Download .exe + addons/ |
+| WebGPU guaranteed | No | No (user's browser) |
+| Offline | PWA mode | Yes |
+| Native APIs | None | Via `@nova/native` (§10.5) |
+| Auto-update | Redeploy | Manual |
+| Mobile | Yes | No |
+| Build deps | None | None |
+| Save to disk | IndexedDB | Via `@nova/native` service |
 
 ---
 
