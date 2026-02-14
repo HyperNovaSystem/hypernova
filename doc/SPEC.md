@@ -97,15 +97,20 @@ All logic lives in systems (functions that query and mutate component data).
 
 ### Entities
 
-An entity is a **generational identifier** — a `u32` index packed with a `u16` generation counter.
+An entity is identified by a **u32 index** (0 to `maxEntities - 1`) used directly as a typed array index.
+A separate `Uint16Array` tracks **generation counters** per index.
 When an entity is destroyed and its index recycled, the generation increments.
 Any handle still holding the old generation is detected as stale, preventing use-after-destroy bugs.
 
+External entity handles encode both index and generation into a single safe JavaScript integer:
+`handle = (generation << 20) | index`, supporting up to ~1M entities and 4096 generations before wrap.
+Internal hot-path code uses the raw index for array access. The generation check happens only at API boundaries (stale handle detection).
+
 ```typescript
-const player = world.spawn();        // Entity { index: 0, generation: 1 }
-const enemy = world.spawn();         // Entity { index: 1, generation: 1 }
+const player = world.spawn();        // index: 0, generation: 1
+const enemy = world.spawn();         // index: 1, generation: 1
 world.destroy(enemy);
-const reused = world.spawn();        // Entity { index: 1, generation: 2 }
+const reused = world.spawn();        // index: 1, generation: 2
 world.isAlive(enemy);                // false — generation mismatch
 ```
 
@@ -140,16 +145,19 @@ const IsPlayer = defineComponent({});
 const IsDead = defineComponent({});
 ```
 
-Component storage uses **archetype-based Struct-of-Arrays** under the hood.
-Entities that share the same set of component types are grouped into an archetype.
-Within each archetype, each component field is stored as a contiguous typed array — e.g., all `Position.x` values for entities with `[Position, Velocity, Sprite]` live in one `Float32Array`.
+Component storage uses **global Struct-of-Arrays (column-per-field)** under the hood.
+Each field defined in a component schema becomes a single global typed array sized to `maxEntities`.
+`Position.x` is one `Float32Array`, `Position.y` is another.
+Entity IDs index directly into these arrays — `Position.x[eid]` is a single typed array read with no indirection.
 
-This gives us the best of both worlds:
-- **Cache-friendly iteration** — systems iterate dense, packed arrays within an archetype.
-- **No holes on destroy** — destroying an entity swap-removes it from its archetype table. No sparse gaps.
-- **Fast component add/remove** — moving an entity between archetypes is an O(1) table move per component.
+This gives us:
+- **Direct access** — `Position.x[eid]` works exactly as written, with no entity-to-row lookup.
+- **Cache-friendly iteration** — systems iterate a list of matching entity IDs; sequential field access within a single array is prefetcher-friendly.
+- **Zero-cost component add/remove** — adding or removing a component flips a bit in the entity's archetype mask. No data is moved between tables.
 
-Adding or removing a component on an entity changes its archetype, which means a move between tables. This is fast but not free — component churn within a single frame should be minimized in hot paths.
+Destroyed entity indices are recycled via a free list. The typed arrays have "holes" at destroyed indices, but this is harmless — iteration uses query result lists, never raw array walks. For the entity counts typical of 2D games (<100K), the memory overhead of pre-allocated arrays is negligible.
+
+**Archetype query resolution.** Each entity has an archetype — a bitmask representing its current set of components. When a query like `world.query(Position, Velocity)` executes, the engine finds all entities whose archetype mask includes both component bits and returns their IDs. Archetype masks update only when components are added or removed (not per-frame). Query results are cached and invalidated on structural changes.
 
 ### Systems
 
@@ -180,7 +188,7 @@ The context object always provides:
 | `entities` | `Entity[]` | Entities matching the system's query |
 | `dt` | `number` | Fixed timestep delta (seconds) |
 | `resources` | `Resources` | Typed resource access |
-| `events` | `Events` | Typed event reader/writer |
+| `events` | `EventAccessor` | Typed event read/emit (see [Events](#events)) |
 | `commands` | `Commands` | Deferred entity spawn/destroy/modify |
 
 ### Queries
@@ -244,38 +252,35 @@ engine.addStage('gameplay', [DamageSystem, DeathSystem, SpawnSystem], {
 
 **Command flush semantics.** Deferred commands are flushed **between stages**, not between batches within a stage. This means all systems within a stage see a consistent world — no entity will appear or disappear mid-stage. Commands are applied in the order they were issued (per system registration order within the stage).
 
-**Event visibility.** Events emitted by systems in a given stage are visible to systems in subsequent stages within the same frame. Events emitted by systems within the same stage are buffered and not visible to sibling systems — they become available at the next stage boundary. This prevents ordering-dependent behavior within a stage.
+**Event visibility.** Each event type (see [Events](#events)) is backed by a double-buffered ring: a **write** buffer and a **read** buffer. Systems emit into the write buffer via `events.emit()`; systems consume from the read buffer via `events.read()`. At each stage boundary the write buffer is merged into the read buffer so that events emitted in stage N become visible to systems in stage N+1 and all later stages within the same frame. Events emitted within a stage are *not* visible to sibling systems in that stage. At the frame boundary all buffers are cleared (cursor reset — no deallocation). This prevents ordering-dependent behavior within a stage while preserving deterministic cross-stage communication.
 
 The `@nova/devtools` profiler visualizes stage and batch execution timelines, highlights per-system execution time, and reports frame budget usage.
 
-> **Workers.** HyperNova uses Web Workers for **background tasks** — pathfinding, proc-gen, autosave — via `@nova/workers` (§10).  These are async operations with results arriving on the next frame via the event bus.  ECS system execution itself runs on the main thread.  See §10 for the worker architecture.
+> **Workers.** HyperNova uses Web Workers for **background tasks** — pathfinding, proc-gen, autosave — via `@nova/workers` (§10).  These are async operations with results arriving on the next frame via the event system.  ECS system execution itself runs on the main thread.  See §10 for the worker architecture.
 
 ### Component Storage
 
-Archetype tables (the contiguous typed arrays that hold component fields) are allocated from a contiguous `ArrayBuffer` arena.  When an archetype is created or grows, it allocates a region from the arena and creates typed array views (`Float32Array`, `Uint32Array`, etc.) over it.
+Component field arrays (the global typed arrays that hold all component data) are allocated from a contiguous `ArrayBuffer` arena at `defineComponent()` time.  Each field gets a typed array view (`Float32Array`, `Uint32Array`, etc.) over a region of the arena, sized to `maxEntities`.
 
 ```
 Component storage arena
 ┌──────────────────────────────────────────────────────────┐
-│  Archetype [Position, Velocity]                          │
-│  ┌─────────────┬─────────────┬──────────┬──────────┐    │
-│  │ Position.x  │ Position.y  │ Vel.x    │ Vel.y    │    │
-│  │ Float32Array│ Float32Array│ Float32A │ Float32A │    │
-│  └─────────────┴─────────────┴──────────┴──────────┘    │
-│  Archetype [Position, Sprite, Health]                    │
-│  ┌─────────────┬─────────────┬──────────┬──────────┐    │
-│  │ Position.x  │ Position.y  │ Sprite   │ Health   │    │
-│  │ Float32Array│ Float32Array│ ...      │ ...      │    │
-│  └─────────────┴─────────────┴──────────┴──────────┘    │
-│  ... more archetypes                                     │
+│  Position.x   Float32Array[maxEntities]                  │
+│  Position.y   Float32Array[maxEntities]                  │
+│  Velocity.x   Float32Array[maxEntities]                  │
+│  Velocity.y   Float32Array[maxEntities]                  │
+│  Health.cur   Float32Array[maxEntities]                   │
+│  Health.max   Float32Array[maxEntities]                   │
+│  ... one array per defined component field                │
 └──────────────────────────────────────────────────────────┘
 ```
 
 **Why an arena?** Allocating all component storage from a single buffer provides:
-- **Cache locality** — archetype tables are packed contiguously, improving prefetch behavior.
-- **Predictable memory usage** — one large allocation instead of many small typed arrays.
+- **Cache locality** — field arrays are packed contiguously, improving prefetch behavior.
+- **Predictable memory usage** — one large allocation instead of many small typed arrays. For 50K max entities with 20 `f32` fields: 4 MB.
 - **WASM interop** — the arena can be backed by `SharedArrayBuffer` if needed, enabling future WASM system implementations to operate directly on component memory without copying.
-- **Growth** — the arena uses a growable `ArrayBuffer` (ES2024 `ArrayBuffer.prototype.resize()`) with a pre-declared `maxByteLength`. Typed array views over a resizable buffer automatically track the new size. When `resize()` is unavailable, the arena falls back to allocate-and-copy.
+- **Stability** — field arrays are allocated once at startup, sized to `maxEntities`. No per-frame growth or reallocation. All typed array views remain valid for the lifetime of the engine.
+- **Growth** — the arena uses a growable `ArrayBuffer` (ES2024 `ArrayBuffer.prototype.resize()`) with a pre-declared `maxByteLength`, reserved for late-registered components. Typed array views over a resizable buffer automatically track the new size. When `resize()` is unavailable, the arena falls back to allocate-and-copy (only triggered by `defineComponent()` after startup, never during gameplay).
 
 The arena is sized with a configurable initial capacity and max capacity:
 
@@ -359,12 +364,12 @@ world.spawn()
 
 The only required package.
 Contains:
-- ECS world, entity management, archetype-based component storage
+- ECS world, entity management, global SoA component storage
 - Generational entity IDs with stale-handle detection
 - Entity hierarchy (Parent/Children, transform propagation)
 - System scheduler (dependency-graph ordering, sequential batch execution) and stage pipeline
 - Game loop (fixed timestep + render interpolation)
-- Event bus (typed, synchronous within a frame)
+- Event system (`defineEvent` type tokens, stage-boundary double-buffered, pull-based)
 - Math library (Vec2, Mat3, AABB, Color, lerp/clamp/remap utilities)
 - Typed resource storage
 - Scene loading and prefab instantiation
@@ -392,7 +397,7 @@ Wraps [Rapier2D](https://rapier.rs/) (Rust → WASM) as the default physics engi
 - Rigid bodies: dynamic, kinematic, static
 - Colliders: circle, box, capsule, convex polygon, heightfield, trimesh
 - Joints: revolute, prismatic, fixed, rope
-- Collision events piped into the ECS event bus
+- Collision events piped into the ECS event system (`CollisionStart`, `CollisionEnd`)
 - Raycasting and shape-casting queries
 - Deterministic simulation (identical results given identical inputs)
 
@@ -641,21 +646,91 @@ const waterMaterial = defineMaterial({
 Every public API surface is strictly typed.
 The engine is authored in TypeScript with `strict: true`, `noUncheckedIndexedAccess: true`, and `exactOptionalPropertyTypes: true`.
 
-### Typed Events
+### Events
 
-Events use discriminated unions — no stringly-typed event names.
+Events are defined with `defineEvent<T>()`, consumed with pull-based iteration, and participate in system scheduling — no strings, no callbacks, no allocations.
+
+#### Defining Events
 
 ```typescript
-type GameEvent =
-  | { type: 'collision'; entityA: Entity; entityB: Entity; normal: Vec2 }
-  | { type: 'entity-destroyed'; entity: Entity }
-  | { type: 'asset-loaded'; key: string; asset: unknown };
+import { defineEvent } from '@nova/core';
 
-// Listeners are type-narrowed automatically
-world.on('collision', (event) => {
-  // event is typed as { type: 'collision', entityA: Entity, ... }
+const CollisionStart = defineEvent<{
+  entityA: Entity;
+  entityB: Entity;
+  normal: Vec2;
+  impulse: number;
+}>();
+
+const CollisionEnd = defineEvent<{
+  entityA: Entity;
+  entityB: Entity;
+}>();
+
+const EntityDestroyed = defineEvent<{ entity: Entity }>();
+```
+
+`defineEvent<T>()` returns a type token (like `defineResource<T>()`). The generic parameter defines the payload shape. No string key is needed — the token is the identity.
+
+#### Emitting and Reading Events
+
+Systems declare event dependencies for scheduling analysis, then use `events.emit()` and `events.read()`:
+
+```typescript
+const DamageSystem = defineSystem({
+  name: 'Damage',
+  query: query(Health).write(Health),
+  events: { read: [CollisionStart], write: [EntityDestroyed] },
+  execute({ events, commands }) {
+    for (const c of events.read(CollisionStart)) {
+      // c is Readonly<{ entityA: Entity; entityB: Entity; normal: Vec2; impulse: number }>
+      const target = c.entityB;
+      Health.current[target] -= c.impulse;
+      if (Health.current[target] <= 0) {
+        events.emit(EntityDestroyed, { entity: target });
+        commands.destroy(target);
+      }
+    }
+  },
 });
 ```
+
+#### EventAccessor Interface
+
+The `events` field on the system context provides:
+
+```typescript
+interface EventAccessor {
+  read<T>(token: EventToken<T>): Iterable<Readonly<T>>;
+  count<T>(token: EventToken<T>): number;
+  hasAny<T>(token: EventToken<T>): boolean;
+  emit<T>(token: EventToken<T>, payload: T): void;
+}
+```
+
+`read()` and `count()` only work for event types declared in the system's `events.read`. `emit()` only works for types in `events.write`. Violations throw in debug mode and are no-ops in production.
+
+#### Storage
+
+Event data is stored in pre-allocated ring buffers — zero heap allocation in steady state. Events with only numeric fields can optionally use an SoA ring (typed arrays, like component storage). Events with complex payloads (strings, nested objects) use an object-pool ring. Buffer capacity is configurable per event type:
+
+```typescript
+const HighFreqEvent = defineEvent<{ value: number }>({ capacity: 1024 });
+```
+
+Default capacity: 256. Overflow in debug mode logs a warning and grows the buffer (one-time allocation); in production, oldest events are overwritten.
+
+#### External Observation (Devtools Only)
+
+For tooling that needs callback-based observation outside the ECS pipeline:
+
+```typescript
+engine.observe(CollisionStart, (event) => {
+  devtoolsPanel.logCollision(event);
+});
+```
+
+`engine.observe()` runs post-frame, is non-deterministic, and is tree-shaken from production builds. It is not for game logic.
 
 ### Generic Components
 
@@ -712,17 +787,19 @@ engine.addPlugin(PhysicsPlugin({
 
 ### Collision Events
 
-Collision events flow through the ECS event bus, not callbacks:
+Collision events flow through the typed event system, not callbacks:
 
 ```typescript
+import { CollisionStart, CollisionEnd } from '@nova/physics-rapier';
+
 const CollisionResponseSystem = defineSystem({
   name: 'CollisionResponse',
-  events: ['collision-start', 'collision-end'],
+  events: { read: [CollisionStart, CollisionEnd] },
   execute({ events, commands }) {
-    for (const { entityA, entityB, normal, impulse } of events.get('collision-start')) {
-      if (world.has(entityA, Projectile) && world.has(entityB, Health)) {
-        // apply damage via commands (deferred until end of stage)
-        commands.set(entityB, Health, { current: Health.current[entityB] - 10 });
+    for (const collision of events.read(CollisionStart)) {
+      // collision is Readonly<{ entityA: Entity; entityB: Entity; normal: Vec2; impulse: number }>
+      if (world.has(collision.entityA, Projectile) && world.has(collision.entityB, Health)) {
+        commands.set(collision.entityB, Health, { current: Health.current[collision.entityB] - 10 });
       }
     }
   },
@@ -887,18 +964,18 @@ const PathfindTask = defineTask({
 
 Submitting a task returns a `TaskTicket` — a lightweight, non-blocking result handle.
 Tickets are **not** Promises (to prevent `await` inside systems).
-The `WorkerSyncSystem` polls tickets and emits results as events.
+The `WorkerSyncSystem` polls tickets and emits results as typed events via the `WorkerResult` event token.
 
 ```typescript
 // In a system's execute function:
-const pool = resources.get<WorkerPool>('workerPool');
+const pool = resources.get(WorkerPool);
 const ticket = pool.submit(PathfindTask, {
   grid: navGrid.data.slice(), // clone for transfer
   width: navGrid.width, height: navGrid.height,
   sx: Position.x[eid], sy: Position.y[eid],
   ex: targetX, ey: targetY,
 });
-// Result arrives via 'worker:result' event on the next frame
+// Result arrives via WorkerResult event on the next frame
 ```
 
 **Pool configuration:**
@@ -985,19 +1062,20 @@ audioStream.send({ samples: audioSamples, sampleRate: 44100 });
 Results from all worker types flow through the same path:
 1. Workers post results to the main thread.
 2. Results accumulate in the `WorkerResultBuffer` resource.
-3. The `WorkerSyncSystem` drains the buffer during the `worker-sync` stage.
-4. Each result is emitted as a `worker:result` event on the typed event bus.
-5. Game systems subscribe to `worker:result` and apply data to components.
+3. The `WorkerSyncSystem` drains the buffer during the `worker-sync` stage and emits `WorkerResult` events.
+4. Game systems read `WorkerResult` via the standard event API and apply data to components.
 
 ```typescript
+import { WorkerResult } from '@nova/workers';
+
 const ApplyPathfindingSystem = defineSystem({
   name: 'ApplyPathfinding',
   query: query(PathRequest, Position),
-  events: ['worker:result'],
+  events: { read: [WorkerResult] },
   execute({ events }) {
-    for (const event of events.get('worker:result')) {
-      if (event.source !== 'pathfind') continue;
-      const { entityId, path } = event.data as PathfindResult;
+    for (const result of events.read(WorkerResult)) {
+      if (result.taskName !== 'pathfind' || result.status !== 'resolved') continue;
+      const { entityId, path } = result.data as PathfindResult;
       PathFollower.waypointCount[entityId] = path.length / 2;
       // Copy path into component storage...
     }
@@ -1209,30 +1287,30 @@ Results from native services flow through the same pattern as worker results:
 
 1. The WebSocket `onmessage` handler pushes incoming data into the `NativeResultBuffer` resource.
 2. The `NativeSyncSystem` drains the buffer during the `native-sync` stage.
-3. Each result is emitted as a `native:result` or `native:event` on the typed event bus.
-4. Game systems subscribe to these events and apply data to components.
+3. Results are emitted as `NativeResult` events; streaming data as `NativeStream` events — both defined with `defineEvent` and consumed via the standard event API.
+4. Game systems read these events with `events.read()` and apply data to components.
 
-**Event types:**
+**Event tokens** (exported from `@nova/native`):
 
 ```typescript
-// Request/response result (correlatable via id)
-type NativeResultEvent = {
-  type: 'native:result';
-  id: number;            // ticket correlation ID
+import { defineEvent } from '@nova/core';
+
+// Request/response result (correlatable via ticketId)
+export const NativeResult = defineEvent<{
+  ticketId: number;
   service: string;
   method: string;
   ok: boolean;
   data?: unknown;
   error?: string;
-};
+}>();
 
-// Unsolicited streaming event (no correlation ID)
-type NativeStreamEvent = {
-  type: 'native:event';
+// Unsolicited streaming event
+export const NativeStream = defineEvent<{
   service: string;
-  event: string;         // event name within the service
+  event: string;
   data: unknown;
-};
+}>();
 ```
 
 **Stage ordering:**
@@ -1330,11 +1408,11 @@ const SerialConnectSystem = defineSystem({
 const SerialDataSystem = defineSystem({
   name: 'SerialData',
   query: query(SerialJoystick, SerialConnected),
-  events: ['native:event'],
+  events: { read: [NativeStream] },
   execute({ entities, events }) {
-    for (const event of events.get('native:event')) {
-      if (event.service !== 'serial' || event.event !== 'data') continue;
-      const [x, y] = event.data.line.split(',').map(Number);
+    for (const evt of events.read(NativeStream)) {
+      if (evt.service !== 'serial' || evt.event !== 'data') continue;
+      const [x, y] = (evt.data as string).split(',').map(Number);
       for (const eid of entities) {
         SerialJoystick.x[eid] = x;
         SerialJoystick.y[eid] = y;
@@ -1706,10 +1784,10 @@ engine.states.switch(PlayingState, {
 In steady state (no entity spawning/destroying), the engine targets **zero heap allocations per frame** to avoid GC pauses.
 
 Strategies:
-- **Object pooling** for events, query result iterators, and worker messages
-- **Pre-allocated typed arrays** for component storage (archetype tables are allocated in chunks)
+- **Ring-buffered events** — each `defineEvent` type is backed by a pre-allocated ring buffer (SoA typed arrays for numeric-only payloads, object-pool ring for complex payloads). Emit advances a write cursor; read iterates without allocation. Buffers are cleared by cursor reset at frame boundary — no deallocation.
+- **Pre-allocated typed arrays** for component storage (field arrays allocated once at startup, sized to `maxEntities`)
 - **Reusable Vec2/Mat3 scratch objects** in math operations — the math library provides a `scratch` API that returns pooled temporaries
-- **No closures in hot paths** — system execute functions receive context via parameters, not captured variables
+- **No closures in hot paths** — system execute functions receive context via parameters, not captured variables; events are pull-based (no callback registration)
 
 The `@nova/devtools` profiler tracks allocations per frame and alerts when the budget is exceeded.
 
