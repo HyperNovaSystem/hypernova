@@ -941,7 +941,8 @@ const jitter = clock.jitter;          // RTT variance
 
 ### Overview
 
-Save/load in HyperNova exploits the SoA arena: all component data is already contiguous typed arrays. Saving = bulk-copy those arrays. Loading = bulk-restore. No per-entity traversal, no serialization.
+Save/load in HyperNova exploits the SoA arena: all component data is already contiguous typed arrays.
+No per-entity traversal, no serialization.
 
 `@nova/persist` is an opt-in plugin that provides save/load via bulk typed array snapshots stored in IndexedDB (web) or the filesystem (local target).
 
