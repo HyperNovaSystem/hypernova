@@ -59,7 +59,7 @@ The game loop uses a **fixed timestep with interpolated rendering**, the gold st
 - **Input** — Polls and buffers all input events from the current frame.
 - **Fixed Update** — Runs simulation logic at a constant rate (default 60 Hz).  Multiple fixed steps may run per frame if the frame budget allows, or none if the frame arrives early.  All gameplay logic, physics, and AI run here.  The accumulator is capped at `maxSubstepsPerFrame * fixedTimestep` (default: 4 steps) to prevent death spirals — excess time is dropped and the simulation slows relative to wall clock. A `BudgetExceeded` event is emitted when steps are dropped (see §18).
 - **Render** — Runs once per frame at display refresh rate. Interpolates between the previous and current simulation state for smooth visuals even when the simulation rate and display rate differ.
-- **Output** - Haptics, sound, and other side effects are triggered during the fixed update to maintain synchronization with the simulation.
+- **Output** — Not a separate stage. Haptics, sound, and other side effects are triggered by systems within the fixed update stages (typically `gameplay` or `post-physics`) to maintain synchronization with the simulation.
 
 This separation is critical for determinism (networking, replays) and decouples visual smoothness from simulation accuracy.
 
@@ -117,6 +117,8 @@ world.isAlive(enemy);                // false — generation mismatch
 Entities have no data and no behavior of their own.
 They are created, destroyed, and recycled by the world.
 
+`world.spawn()` returns an `Entity` directly. If `maxEntities` is reached, the engine halts (fatal error). For cases where exhaustion is expected and recoverable, `world.trySpawn()` returns `Result<Entity, EngineError>`. The builder pattern (`world.spawn().add(...)`) chains on the direct `spawn()` API.
+
 ### Components
 
 Components are pure data with no methods.
@@ -140,7 +142,7 @@ const Health = defineComponent({
   max: Types.f32,
 });
 
-// Tag components (no data, just flags)
+// Tag components (no data, just flags — zero arena allocation, tracked by archetype bitmask only)
 const IsPlayer = defineComponent({});
 const IsDead = defineComponent({});
 ```
@@ -157,12 +159,14 @@ This gives us:
 
 Destroyed entity indices are recycled via a free list. The typed arrays have "holes" at destroyed indices, but this is harmless — iteration uses query result lists, never raw array walks. For the entity counts typical of 2D games (<100K), the memory overhead of pre-allocated arrays is negligible.
 
+**String fields** (`Types.string`) use string interning: a global `StringTable` maps strings to integer indices, and `Types.string` fields are backed by `Uint32Array` storing intern indices (index 0 = empty string). String resolution is deferred to point-of-use. The StringTable grows monotonically — interned strings are never freed. For the typical use case (scene metadata, entity names, prefab IDs), the table size is bounded by content and doesn't grow per-frame. If a use case requires frequent unique strings, use a resource (`Map<Entity, string>`) instead of a `Types.string` component field.
+
 **Archetype query resolution.** Each entity has an archetype — a bitmask representing its current set of components. When a query like `world.query(Position, Velocity)` executes, the engine finds all entities whose archetype mask includes both component bits and returns their IDs. Archetype masks update only when components are added or removed (not per-frame). Query results are cached and invalidated on structural changes.
 
 ### Systems
 
 Systems are functions registered with the world.
-They declare which components they read and write, enabling automatic scheduling and dependency analysis.
+They declare which components they read and write via `query(...).read(...).write(...)`, enabling automatic scheduling and dependency analysis. Component access declarations live on the query — there are no separate top-level `reads`/`writes` fields.
 
 Every system's `execute` receives a single **context object** with a consistent shape:
 
@@ -293,6 +297,7 @@ The arena is sized with a configurable initial capacity and max capacity:
 
 ```typescript
 const engine = new Engine({
+  maxEntities: 50_000,                   // default: 50,000 — sets typed array sizes
   arenaInitialSize: 4 * 1024 * 1024,   // 4 MB initial
   arenaMaxSize: 64 * 1024 * 1024,      // 64 MB ceiling
 });
@@ -346,7 +351,17 @@ world.addComponent(sword, Parent, { entity: player });
 // Children component is automatically added/updated on the parent
 ```
 
-**Transform propagation:** A built-in `TransformPropagationSystem` runs in `render-prep` and computes world-space transforms from local transforms + parent chain.  Systems read `LocalTransform` (position/rotation/scale relative to parent) and the engine produces `WorldTransform` (absolute).
+**Transform model:** `Position` is always **local** — relative to the entity's parent (or world-space if no parent). A built-in `TransformPropagationSystem` runs in `render-prep` and computes `WorldTransform` (absolute position/rotation/scale) by walking the parent chain. The renderer reads `WorldTransform` for drawing. Gameplay systems read/write `Position` (local). Physics syncs to `Position`.
+
+For root entities (no parent), `Position` = world position and `WorldTransform` mirrors it directly (no transform math).
+
+```typescript
+// Position is the local transform — always present on placed entities
+const Position = defineComponent({ x: Types.f32, y: Types.f32 });
+
+// WorldTransform is computed by TransformPropagationSystem — read-only for game code
+const WorldTransform = defineComponent({ x: Types.f32, y: Types.f32, rotation: Types.f32, scaleX: Types.f32, scaleY: Types.f32 });
+```
 
 **Destroy cascades:** Destroying a parent entity destroys all descendants. This can be disabled per-entity with the `OrphanOnDestroy` tag component.
 
@@ -396,7 +411,13 @@ Primary renderer targeting WebGPU with automatic WebGL2 fallback.
 - **Camera.** Multiple cameras with independent viewports, zoom, rotation, and render-to-texture.
 - **Custom shaders.** Define custom materials with a shader graph or raw WGSL/GLSL.
 
-The renderer reads `Sprite`, `Transform`, `TilemapLayer`, and `Camera` components from the ECS world. It does not own game objects.
+The renderer reads `Sprite`, `WorldTransform`, `RenderOrder`, `TilemapLayer`, and `Camera` components from the ECS world. It does not own game objects.
+
+**`RenderOrder` component:** Controls draw order (z-index equivalent). Entities are sorted by `layer` (integer, lower draws first), then by texture/blend mode for batching. Default layer is 0.
+
+```typescript
+const RenderOrder = defineComponent({ layer: Types.i32 });  // built-in, from @nova/renderer-webgpu
+```
 
 ### `@nova/physics-rapier`
 
@@ -475,8 +496,15 @@ const manifest = defineManifest({
   },
 });
 
-const assets = await engine.loadManifest(manifest);
-const playerTexture = assets.textures.player; // fully typed
+const result = await engine.loadManifest(manifest);
+// loadManifest returns Result<ManifestAssets, AssetLoadReport>
+// After a successful load, assets are ready — direct typed access:
+const playerTexture = result.value.textures.player;
+
+// For individually loaded or streamed assets, use AssetHandle<T>
+// which provides status/value/fallback (see §18.6):
+const bgm = assets.get('bgm'); // AssetHandle<AudioBuffer> — may still be streaming
+renderer.playMusic(bgm.value ?? bgm.fallback);
 ```
 
 ### `@nova/tilemap`
@@ -524,19 +552,19 @@ Tween.to(entity, Position, { x: 500 }, {
   onComplete: () => { /* ... */ },
 });
 
-// State machine
+// State machine — transition conditions receive the entity ID
 const playerAnimations = defineAnimationState({
   initial: 'idle',
   states: {
     idle: { animation: idleAnim, transitions: [
-      { to: 'run', when: ({ Velocity }) => Math.abs(Velocity.x[eid]) > 0.1 },
+      { to: 'run', when: (eid) => Math.abs(Velocity.x[eid]) > 0.1 },
     ]},
     run: { animation: walkAnim, transitions: [
-      { to: 'idle', when: ({ Velocity }) => Math.abs(Velocity.x[eid]) < 0.1 },
-      { to: 'jump', when: ({ Velocity }) => Velocity.y[eid] < -1 },
+      { to: 'idle', when: (eid) => Math.abs(Velocity.x[eid]) < 0.1 },
+      { to: 'jump', when: (eid) => Velocity.y[eid] < -1 },
     ]},
     jump: { animation: jumpAnim, transitions: [
-      { to: 'fall', when: ({ Velocity }) => Velocity.y[eid] > 0 },
+      { to: 'fall', when: (eid) => Velocity.y[eid] > 0 },
     ]},
   },
 });
@@ -879,17 +907,17 @@ Instead, it provides primitives that support common patterns:
 
 ### Snapshot Serialization
 
+v1 uses JSON for snapshot serialization (simple, debuggable). A custom binary format with delta compression and quantization is a v2 optimization — the SoA layout makes this a natural evolution (typed arrays are already contiguous, serialization is close to memcpy), but should be informed by profiling of the JSON path first.
+
 ```typescript
 import { WorldSerializer } from '@nova/net';
 
 const serializer = new WorldSerializer(world, {
   // Only sync these components over the network
   components: [Position, Velocity, Health, SpriteIndex],
-  // Quantize positions to reduce bandwidth
-  quantize: { Position: { x: 0.1, y: 0.1 } },
 });
 
-const snapshot = serializer.serialize();     // Uint8Array
+const snapshot = serializer.serialize();     // Uint8Array (JSON-encoded in v1)
 serializer.deserialize(snapshot);            // apply to world
 const delta = serializer.serializeDelta(previousSnapshot); // only changed data
 ```
@@ -913,246 +941,72 @@ const jitter = clock.jitter;          // RTT variance
 
 ### Overview
 
-Save/load is fundamental to game engines, but traditional approaches (serialize everything on save, deserialize on load) are O(entities x components) — slow and fragile. HyperNova's SoA arena already stores all component data as contiguous typed arrays. SQLite stores BLOBs as flat byte buffers. The mapping between them is `memcpy` — zero serialization, zero per-entity iteration.
+Save/load in HyperNova exploits the SoA arena: all component data is already contiguous typed arrays. Saving = bulk-copy those arrays. Loading = bulk-restore. No per-entity traversal, no serialization.
 
-`@nova/persist` is an opt-in plugin that uses **SQLite as a continuously-mirrored shadow of the ECS arena**. The database is kept in sync with the typed arrays via periodic background flushes. Save/load reduces to snapshot management:
+`@nova/persist` is an opt-in plugin that provides save/load via bulk typed array snapshots stored in IndexedDB (web) or the filesystem (local target).
 
-- **Save** = tag the current mirrored state with a name (data is already on disk)
-- **Load** = restore a tagged state and bulk-copy BLOBs back into the arena
-- **Crash recovery** = on unclean shutdown, the live database has the last synced state
+### Core Design
 
-This transforms save/load from O(entities x components) traversal into O(columns) bulk copies. For a game with 20 component fields and 50,000 entities, saving copies 20 BLOBs instead of walking 50,000 entities.
+**Save** = copy each persistent component's typed array into a snapshot blob. For a game with 20 component fields and 50K entities: 20 bulk copies, not 50K entity walks.
 
-### SQLite Schema
+**Load** = restore snapshot blobs into the arena's typed arrays + invalidate query caches.
 
-The schema mirrors the SoA arena structure. Each component field column is stored as a single BLOB row — not one row per entity.
+```typescript
+// Save
+persist.save('checkpoint-3');
+// Internally: for each persistent column → typedArray.slice() → store blob
+// Emit SaveCompleted event when done
 
-```sql
--- Column metadata (written once per defineComponent)
-CREATE TABLE nova_columns (
-  column_id         INTEGER PRIMARY KEY,
-  component         TEXT NOT NULL,
-  field             TEXT NOT NULL,
-  typed_array_type  TEXT NOT NULL,     -- 'Float32Array', 'Uint32Array', etc.
-  bytes_per_element INTEGER NOT NULL,
-  UNIQUE(component, field)
-);
-
--- Live state: one row per column, continuously updated
-CREATE TABLE nova_live (
-  column_id   INTEGER PRIMARY KEY REFERENCES nova_columns(column_id),
-  data        BLOB NOT NULL,           -- raw typed array bytes
-  sync_tick   INTEGER NOT NULL DEFAULT 0
-);
-
--- Entity metadata (singleton row)
-CREATE TABLE nova_entities (
-  id          INTEGER PRIMARY KEY DEFAULT 1,
-  generations BLOB NOT NULL,           -- Uint16Array[maxEntities] raw bytes
-  archetypes  BLOB NOT NULL,           -- bitmask array raw bytes
-  free_list   BLOB NOT NULL,
-  alive_count INTEGER NOT NULL,
-  max_eid     INTEGER NOT NULL,
-  tick        INTEGER NOT NULL DEFAULT 0
-);
-
--- String interning (mirrors global StringTable)
-CREATE TABLE nova_strings (
-  intern_id   INTEGER PRIMARY KEY,
-  value       TEXT NOT NULL
-);
-
--- Typed resources (opt-in only)
-CREATE TABLE nova_resources (
-  token_id    INTEGER PRIMARY KEY,
-  name        TEXT NOT NULL,
-  data        BLOB,                    -- binary serializable resources
-  json        TEXT                     -- JSON serializable resources
-);
-
--- Named snapshots (save points)
-CREATE TABLE nova_snapshots (
-  snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT NOT NULL UNIQUE,
-  tick        INTEGER NOT NULL,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  metadata    TEXT                     -- JSON: playtime, scene, custom data
-);
-
--- Snapshot column data (full copies)
-CREATE TABLE nova_snapshot_columns (
-  snapshot_id INTEGER REFERENCES nova_snapshots(snapshot_id) ON DELETE CASCADE,
-  column_id   INTEGER REFERENCES nova_columns(column_id),
-  data        BLOB NOT NULL,
-  PRIMARY KEY (snapshot_id, column_id)
-);
-
--- (+ corresponding snapshot tables for entities, strings, resources)
+// Load
+persist.load('checkpoint-3');
+// Internally: pause loop → bulk restore blobs → invalidate queries → resume
+// Emit LoadCompleted event
 ```
-
-**Key design decision:** One row per *column*, not per entity. A game with 50K entities and 20 f32 fields has 20 rows in `nova_live`. Every sync is 20 `UPDATE` statements with BLOB binds. Each BLOB is a direct copy of the typed array's underlying `ArrayBuffer` region.
-
-### Dirty Column Tracking (Persistence)
-
-The system scheduler already knows which systems write which components (from `query().write(Position)` declarations). A lightweight `PersistMarkSystem` runs at the end of each frame and checks the scheduler's write-set — O(systems_that_ran), not O(entities).
-
-False positives (system declared write but didn't modify anything) are acceptable. The cost is one unnecessary ~200KB BLOB copy every few seconds — well within a worker's budget.
-
-This is **column-level** tracking (was *any* entity's Health written?) used for persistence sync. For **entity-level** change detection (`.changed()` queries), see [Queries — change detection](#queries).
-
-### Entity-Level Change Detection
-
-The `.changed(Component)` query filter provides per-entity precision via double-buffered snapshot comparison. A `ChangeDetectionSnapshotSystem` runs at frame end (same stage as `PersistMarkSystem`) and copies each tracked field's live array into its snapshot:
-
-```
-frame-end stage:
-  PersistMarkSystem:            check scheduler write-sets → mark dirty columns
-  ChangeDetectionSnapshotSystem: snapshot.set(liveArray) for each tracked field
-```
-
-The two mechanisms are complementary:
-- **Column-level dirty flags** → persistence decides *which columns* to sync (coarse, O(systems))
-- **Snapshot comparison** → `.changed()` queries find *which entities* changed (precise, O(matched entities))
-
-The scheduler write-set also serves as a free pre-filter for snapshot comparison: if no writer system ran for a component, `.changed()` returns zero entities without any comparison.
-
-### Background Sync
-
-Sync runs as a `defineJob` periodic worker (same pattern as `AutosaveJob` in §10).
-
-```
-MAIN THREAD                                    WORKER (defineJob)
-===========                                    ==================
-
-persist-mark stage (after render-prep):
-  check scheduler write-sets → mark dirty columns
-
-Every N seconds (sync interval):
-  collect dirty columns:
-    data = typedArray.slice()              ──►  BEGIN TRANSACTION
-  transfer via Transferable (zero-copy)          UPDATE nova_live SET data=? (per column)
-                                                 UPDATE nova_entities ...
-                                                COMMIT
-                                                return { synced, tick }
-                                           ◄──
-  worker-sync stage:
-    drain result, update sync watermarks
-```
-
-### Save Operation
-
-```
-persist.save('checkpoint-3')
-  1. Force-sync all dirty columns (immediate flush)
-  2. Worker executes:
-     INSERT INTO nova_snapshots (name, tick, ...) ...
-     INSERT INTO nova_snapshot_columns SELECT ... FROM nova_live   -- bulk copy
-     (+ entity metadata, string table, resources)
-  3. Emit SaveCompleted event
-```
-
-Save is O(columns): a handful of SQL INSERT statements copying existing BLOBs.
-
-### Load Operation
-
-```
-persist.load('checkpoint-3')
-  1. Pause game loop
-  2. Worker reads all snapshot BLOBs, transfers via Transferable
-  3. Main thread (at stage boundary, atomically):
-     for each column: targetArray.set(new TypedArrayConstructor(blob))
-     restore entity metadata (generations, archetypes, free list)
-     restore string table
-     restore resources
-     invalidate all query caches
-  4. Resume game loop, emit LoadCompleted event
-```
-
-Main-thread restore for 20 columns x 200KB = 4MB total `memcpy`: well under 1ms.
 
 ### Component Persistence Control
 
-Components persist by default — define-and-forget. Opt out per-component or at the plugin level:
+Components persist by default. Opt out per-component:
 
 ```typescript
-// Persists by default
-const Position = defineComponent({ x: Types.f32, y: Types.f32 });
-
-// Explicitly transient
+const Position = defineComponent({ x: Types.f32, y: Types.f32 });           // persists
 const ParticleVelocity = defineComponent(
   { x: Types.f32, y: Types.f32 },
-  { persist: false }
+  { persist: false }                                                         // transient
 );
 ```
 
-Resources do **not** persist by default (most are runtime handles). Explicitly opt in via plugin config.
-
-| Category | Persist? | Examples |
-|----------|----------|----------|
-| Gameplay state | Yes (default) | Position, Health, Inventory |
-| Scene metadata | Yes (default) | Name, SceneEntity, PrefabInstance |
-| Physics config | Yes (default) | RigidBody, Collider (setup, not live state) |
-| Physics runtime | No (exclude) | Rapier-owned velocity state |
-| Particles | No (exclude) | ParticlePosition, ParticleLifetime |
-| Debug/editor | No (exclude) | DebugOverlay, EditorOnly, GizmoHighlight |
-| Render cache | No (exclude) | RenderBatch, SortKey |
-
-### Plugin Configuration
-
-```typescript
-import { PersistPlugin } from '@nova/persist';
-
-engine.addPlugin(PersistPlugin({
-  dbName: 'my-game',                   // database name
-  driver: 'auto',                      // auto-detect platform
-  syncIntervalMs: 5000,                // flush every 5 seconds
-  immediateOn: [SceneLoaded],          // force-sync on specific events
-  exclude: [ParticleVelocity, DebugOverlay],
-  resources: [GameState, QuestLog],    // opt-in resource persistence
-  maxSnapshots: 100,                   // auto-prune oldest
-
-  // Optional: Turso cloud sync (libsql embedded replicas)
-  turso: {
-    url: 'libsql://saves.my-game.turso.io',
-    authToken: process.env.TURSO_TOKEN,
-    syncInterval: 60_000,              // cloud sync every 60s
-  },
-}));
-```
+Resources do **not** persist by default. Opt in via plugin config.
 
 ### Public API
 
 ```typescript
-// PersistStore resource — game's interface to save/load
 interface PersistStore {
-  save(name: string, metadata?: Record<string, unknown>): SaveTicket;
-  load(name: string): LoadTicket;
-  quickSave(): SaveTicket;             // saves as '__quicksave'
-  quickLoad(): LoadTicket;             // loads '__quicksave'
+  save(name: string, metadata?: Record<string, unknown>): void;
+  load(name: string): void;
+  quickSave(): void;
+  quickLoad(): void;
   listSnapshots(): SnapshotInfo[];
   deleteSnapshot(name: string): void;
-  forceSyncNow(): void;
-  readonly lastSyncTick: number;
-  readonly isDirty: boolean;
 }
+```
 
-interface SnapshotInfo {
-  name: string;
-  tick: number;
-  createdAt: string;
-  metadata?: Record<string, unknown>;
-}
+### Storage Backend
 
-// Ticket pattern (matches TaskTicket/NativeTicket conventions)
-interface SaveTicket {
-  readonly id: number;
-  readonly status: 'pending' | 'syncing' | 'snapshotting' | 'completed' | 'failed';
-}
+| Target | Backend | Notes |
+|--------|---------|-------|
+| Web | IndexedDB | Blob storage, works everywhere |
+| Local (Node.js) | Filesystem (JSON + binary blobs) | Simple file-based snapshots |
+| Testing | In-memory | No persistence, fast tests |
 
-interface LoadTicket {
-  readonly id: number;
-  readonly status: 'pending' | 'reading' | 'restoring' | 'completed' | 'failed';
-}
+### Plugin Configuration
+
+```typescript
+engine.addPlugin(PersistPlugin({
+  dbName: 'my-game',
+  exclude: [ParticleVelocity, DebugOverlay],
+  resources: [GameState, QuestLog],
+  maxSnapshots: 100,
+}));
 ```
 
 ### Events
@@ -1160,95 +1014,17 @@ interface LoadTicket {
 ```typescript
 const SaveCompleted = defineEvent<{ name: string; tick: number; durationMs: number }>();
 const LoadCompleted = defineEvent<{ name: string; tick: number; durationMs: number }>();
-const CrashRecoveryAvailable = defineEvent<{ tick: number; lastSyncTimestamp: number }>();
-const PersistError = defineEvent<{ operation: 'save' | 'load' | 'sync'; error: EngineError }>();
 ```
 
-### Usage in Systems
+### Future (v2+)
 
-```typescript
-const SaveLoadSystem = defineSystem({
-  name: 'SaveLoad',
-  resources: { read: [PersistStore, InputState] },
-  events: { read: [SaveCompleted, LoadCompleted] },
-  execute({ resources, events }) {
-    const persist = resources.get(PersistStore);
-    const input = resources.get(InputState);
+The following capabilities are deferred to after the core engine is proven:
+- **SQLite-backed continuous mirroring** — background sync of dirty columns to SQLite BLOBs for crash recovery
+- **Cloud saves** — via Turso embedded replicas or similar
+- **Time-travel debugging** — per-tick delta logging for stepping backwards in devtools
+- **Editor undo/redo** — micro-snapshots of modified columns
 
-    if (input.justPressed('quicksave')) persist.quickSave();
-    if (input.justPressed('quickload')) persist.quickLoad();
-
-    for (const evt of events.read(SaveCompleted)) {
-      showNotification(`Saved "${evt.name}" (${evt.durationMs}ms)`);
-    }
-  },
-});
-```
-
-### Cross-Platform Drivers
-
-`@nova/persist` defines an abstract `PersistDriver` interface. Platform-specific implementations are auto-selected:
-
-| Target | Driver | Notes |
-|--------|--------|-------|
-| Local (Node.js) | `better-sqlite3` in worker | Synchronous, fastest, via `defineJob` |
-| Local + cloud | `@libsql/client` | Turso embedded replicas for cloud saves |
-| Web | `wa-sqlite` + OPFS | Persistent, requires COOP/COEP headers (already needed for `SharedArrayBuffer`) |
-| Web fallback | `wa-sqlite` + IndexedDB VFS | Wider browser support |
-| Testing | In-memory SQLite | No persistence, fast tests |
-
-The fallback chain is transparent to game code. On web, `wa-sqlite` with OPFS requires the `OPFSCoopSyncVFS` running in a worker (same execution model as the sync job). `PRAGMA journal_mode=truncate` and an increased page cache (16MB) are recommended for OPFS performance.
-
-### Relationship to `@nova/net` Serializer
-
-`@nova/persist` and `WorldSerializer` are complementary, not redundant:
-
-| | `@nova/net` WorldSerializer | `@nova/persist` |
-|--|---------------------------|-----------------|
-| Purpose | Network replication | Disk persistence |
-| Frequency | Every tick (60Hz) | Every N seconds |
-| Fidelity | Lossy (quantized) | Lossless |
-| Scope | Component subset | All persistent |
-| Format | Custom binary wire protocol | Raw typed array BLOBs in SQLite |
-| Delta | Change bitmask per tick | Full column replacement |
-
-The change bitmask diff utility (used by `@nova/net` for delta compression) should be extracted to `@nova/core` as a shared utility — `@nova/persist` reuses it for time-travel debugging in devtools.
-
-### Advanced Capabilities
-
-**Crash recovery:** On startup, the plugin checks for a non-zero tick in `nova_entities`. If found, the previous session did not shut down cleanly — a `CrashRecoveryAvailable` event is emitted with the last synced tick and timestamp. The game can offer "Continue from last session?" or auto-restore.
-
-**Cloud saves via Turso:** When configured, `@libsql/client` creates an embedded replica — a local SQLite database that syncs to a remote Turso instance. Saves work offline; cloud sync happens when connection returns. This gives cross-device save continuity with zero extra code in game systems.
-
-**Time-travel debugging (devtools only):** When `@nova/devtools` is active, the persist system can log per-tick deltas using `@nova/net`'s change bitmask format. A retention window (default: 600 ticks / 10 seconds) enables stepping backwards in the inspector, viewing state at any past tick, and visual diffing of component values. Tree-shaken from production builds.
-
-**Editor undo/redo:** Micro-snapshots that capture only the columns modified by an editor operation. The undo stack stores "before" BLOBs; undo restores them, redo stores "after". Integrates with the visual editor's existing round-trip persistence (§13).
-
-### Package Structure
-
-```
-packages/persist/
-  src/
-    index.ts              -- public exports
-    plugin.ts             -- PersistPlugin factory
-    types.ts              -- config, PersistStore, tickets, events
-    schema.ts             -- SQL DDL + migration
-    driver/
-      types.ts            -- PersistDriver interface
-      better-sqlite3.ts   -- local target
-      wa-sqlite.ts        -- web target (OPFS)
-      libsql.ts           -- Turso cloud sync
-      memory.ts           -- testing
-    change-detection.ts   -- snapshot comparison utility (shared with @nova/net, @nova/devtools)
-    sync/
-      dirty-tracker.ts    -- column dirty state
-      sync-job.ts         -- defineJob worker
-      sync-system.ts      -- PersistMarkSystem + ChangeDetectionSnapshotSystem + result drain
-    snapshot/
-      save.ts             -- snapshot creation
-      load.ts             -- snapshot restore
-      manager.ts          -- list/delete/prune
-```
+The memcpy-to-BLOB design insight (one SQL row per column, not per entity) remains the intended migration path when continuous mirroring is needed
 
 ---
 
@@ -1499,312 +1275,23 @@ Cleanup (worker termination) is registered on engine dispose.
 
 ---
 
-## 10.5 Native Module Bridge (`@nova/native`)
+## 10.5 Native Module Bridge (`@nova/native`) — Future
+
+> **Scope note:** `@nova/native` is deferred to Phase 4+. This section captures the design intent for when native module access is needed. The core engine and web target do not depend on it.
 
 ### Overview
 
-The local exe target (§16.2) runs a Node.js server process that serves the game to the user's browser. Game code executes in browser context and has no access to Node.js APIs or native modules. `@nova/native` bridges this gap — it provides a typed WebSocket bridge between browser game code and native Node.js modules running in the server process.
+The local exe target (§16.2) runs a Node.js server process. `@nova/native` provides a typed WebSocket bridge between browser game code and native Node.js modules (serial ports, GPIO, USB HID, filesystem) running in the server process. On the web target it degrades gracefully — `NativeBridge.available` is `false` and calls return immediately-rejected tickets.
 
-This enables use cases that require hardware or OS access: serial ports (`serialport`), GPIO, USB HID devices, native filesystem, spawning child processes, and any other Node.js native addon.
+### Design Sketch
 
-`@nova/native` is only active on the local target. On the web target it degrades gracefully — game code runs identically but native services are unavailable.
+- **Server:** `defineNativeService({ name, init, methods, dispose })` — async methods callable from game code, `emit()` for streaming data to browser
+- **Client:** `defineNativeClient<T>({ name })` — typed proxy, calls return `NativeTicket` (not Promise), results arrive via `NativeResult` / `NativeStream` events
+- **ECS integration:** `NativeSyncSystem` drains results in a `native-sync` stage (after `worker-sync`), same pattern as `@nova/workers`
+- **Wire protocol:** JSON text frames for control, binary frames with 4-byte header for high-frequency data
+- **Graceful degradation:** On web target, `NativeBridge.available` is `false`, calls return immediately-rejected tickets
 
-### Architecture
-
-```
-Browser (game code)                          Node.js Server (SEA)
-───────────────────                          ────────────────────
-@nova/native client                          @nova/native/server
-  NativeBridge resource                        ServiceRegistry
-  NativeResultBuffer                             ├── SerialService
-  NativeSyncSystem                               ├── FileSystemService
-       │                                         └── ... user services
-       │         WebSocket (ws://127.0.0.1/__nova)
-       └────────────────────────────────────────►┘
-           ← native:result (request/response)
-           ← native:event  (streaming data)
-           → call(service, method, args)
-```
-
-The WebSocket endpoint is `/__nova` on the same port as the HTTP server — no additional ports needed. The `ws` library (pure JS, ~25 KB, no native dependencies) handles WebSocket framing on the server side.
-
-### Defining Native Services (Server-Side)
-
-Native services are defined in separate modules and registered with the embedded server. They follow the engine's `define*` naming convention.
-
-```typescript
-// services/serial.service.ts — runs in Node.js
-import { defineNativeService } from '@nova/native/server';
-
-export const SerialService = defineNativeService({
-  name: 'serial',
-
-  // Service state, created once on startup
-  init: () => ({
-    ports: new Map<string, SerialPort>(),
-  }),
-
-  // Methods callable from game code (request → response)
-  methods: {
-    async list(state) {
-      const { SerialPort } = await import('serialport');
-      return SerialPort.list();
-    },
-
-    async open(state, args: { path: string; baudRate: number }, emit) {
-      const { SerialPort, ReadlineParser } = await import('serialport');
-      const port = new SerialPort({ path: args.path, baudRate: args.baudRate });
-      const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
-
-      // Streaming: native data → game events via emit()
-      parser.on('data', (line: string) => {
-        emit('data', { path: args.path, line });
-      });
-
-      port.on('close', () => {
-        emit('close', { path: args.path });
-        state.ports.delete(args.path);
-      });
-
-      state.ports.set(args.path, port);
-      return { path: args.path, opened: true };
-    },
-
-    async write(state, args: { path: string; bytes: Uint8Array }) {
-      const port = state.ports.get(args.path);
-      if (!port) throw new Error(`Port ${args.path} not open`);
-      port.write(Buffer.from(args.bytes));
-      return { written: args.bytes.length };
-    },
-
-    async close(state, args: { path: string }) {
-      const port = state.ports.get(args.path);
-      if (!port) throw new Error(`Port ${args.path} not open`);
-      port.close();
-      state.ports.delete(args.path);
-      return { closed: true };
-    },
-  },
-
-  // Cleanup on server shutdown
-  dispose(state) {
-    for (const port of state.ports.values()) port.close();
-  },
-});
-```
-
-**Key design points:**
-- Methods are `async` on the server side. The async boundary is hidden from game code by the bridge.
-- The `emit(event, data)` callback pushes unsolicited events to the browser — this is how continuous data sources (serial input, sensor readings, file watchers) stream into the game.
-- `init()`/`dispose()` manage native resource lifecycles. `dispose` runs on `SIGINT`/`SIGTERM`.
-- Dynamic `import()` for native modules avoids errors when the service definition is loaded in a non-Node.js context (e.g., during type-checking).
-
-Services are configured in `nova.config.ts`:
-
-```typescript
-export default {
-  export: {
-    local: {
-      native: {
-        services: ['./services/serial.service'],
-      },
-    },
-  },
-};
-```
-
-### Consuming Native Services (Client-Side)
-
-Game code uses typed clients that mirror the server service shape.
-
-```typescript
-// Runs in browser context
-import { defineNativeClient } from '@nova/native';
-import type { SerialService } from '../services/serial.service';
-
-const Serial = defineNativeClient<typeof SerialService>({
-  name: 'serial',  // must match server-side service name
-});
-```
-
-`defineNativeClient` produces a client handle used with the `NativeBridge` resource. Calls return a `NativeTicket` — not a Promise. This matches the `TaskTicket` pattern from `@nova/workers` and prevents `await` inside system `execute` functions.
-
-```typescript
-interface NativeTicket<T> {
-  readonly id: number;
-  readonly service: string;
-  readonly method: string;
-  readonly status: 'pending' | 'resolved' | 'rejected' | 'disconnected';
-  // Not a Promise — no .then(), no await
-}
-```
-
-When the WebSocket closes, all pending tickets transition to `'disconnected'`. The `NativeSyncSystem` emits `NativeResult` events with `ok: false` for each.
-
-### ECS Integration
-
-Results from native services flow through the same pattern as worker results:
-
-1. The WebSocket `onmessage` handler pushes incoming data into the `NativeResultBuffer` resource.
-2. The `NativeSyncSystem` drains the buffer during the `native-sync` stage.
-3. Results are emitted as `NativeResult` events; streaming data as `NativeStream` events — both defined with `defineEvent` and consumed via the standard event API.
-4. Game systems read these events with `events.read()` and apply data to components.
-
-**Event tokens** (exported from `@nova/native`):
-
-```typescript
-import { defineEvent } from '@nova/core';
-
-// Request/response result (correlatable via ticketId)
-export const NativeResult = defineEvent<{
-  ticketId: number;
-  service: string;
-  method: string;
-  ok: boolean;
-  data?: unknown;
-  error?: string;
-}>();
-
-// Unsolicited streaming event
-export const NativeStream = defineEvent<{
-  service: string;
-  event: string;
-  data: unknown;
-}>();
-```
-
-**Stage ordering:**
-
-```typescript
-engine.addStage('input',        [InputGatherSystem]);
-engine.addStage('worker-sync',  [WorkerSyncSystem]);
-engine.addStage('native-sync',  [NativeSyncSystem]);
-engine.addStage('pre-physics',  [MovementSystem, AISystem, ApplySerialDataSystem]);
-// ... remaining stages
-```
-
-The `native-sync` stage runs after `worker-sync` and before gameplay systems. Native calls submitted during gameplay are processed by the server between frames and consumed at the start of the next frame's `native-sync` stage.
-
-For high-frequency data (e.g., serial port at 115200 baud), multiple events may accumulate per frame. All are delivered as a single batch during `native-sync`, giving systems a deterministic set to process.
-
-### Disconnection & Reconnection
-
-When the WebSocket to the native server drops:
-
-1. `NativeBridge.available` becomes `false`.
-2. All pending `NativeTicket`s transition to `'disconnected'` status.
-3. `NativeSyncSystem` emits `NativeResult` events with `ok: false` for each pending ticket.
-4. A `BridgeDisconnected` event is emitted (see §18.9).
-5. Auto-reconnect begins with exponential backoff (configurable):
-
-```typescript
-engine.addPlugin(NativePlugin({
-  clients: [Serial, GPIO],
-  reconnect: {
-    enabled: true,          // default: true
-    initialDelay: 500,      // ms
-    maxDelay: 10_000,       // ms
-    backoffFactor: 2,
-  },
-}));
-```
-
-On successful reconnect, `NativeBridge.available` becomes `true` and a `BridgeReconnected` event is emitted.
-
-### Graceful Degradation
-
-On the web target (no Node.js server), `@nova/native` installs but operates in stub mode:
-
-- `NativeBridge.available` is `false`
-- `call()` returns an immediately-rejected `NativeTicket` with error `'Native services unavailable in web target'`
-- `NativeSyncSystem` runs but finds an empty buffer — zero cost
-- No WebSocket connection is attempted
-
-Game code guards with an availability check:
-
-```typescript
-execute({ resources }) {
-  const bridge = resources.get(NativeBridge);
-  if (!bridge.available) return;
-  // ... native operations
-}
-```
-
-This matches the graceful degradation pattern from `@nova/workers` (§10): game code behaves identically regardless of native service availability.
-
-### Wire Protocol
-
-Control messages use JSON text frames:
-
-```typescript
-// Client → Server
-{ id: number; service: string; method: string; payload: unknown }
-
-// Server → Client (response)
-{ id: number; ok: boolean; data?: unknown; error?: string }
-
-// Server → Client (streaming event, unsolicited)
-{ id: 0; service: string; event: string; data: unknown }
-```
-
-Binary data (high-frequency byte streams) uses WebSocket binary frames with a 4-byte header: `[service_id: u16][event_id: u16][payload: Uint8Array]`. Service and event IDs are negotiated during the handshake.
-
-### Plugin
-
-```typescript
-import { NativePlugin, defineNativeClient } from '@nova/native';
-
-engine.addPlugin(NativePlugin({
-  clients: [Serial, GPIO],
-}));
-```
-
-The plugin creates the `NativeBridge` resource, `NativeResultBuffer` resource, attempts WebSocket connection (skipped on web target), and inserts the `native-sync` stage. Cleanup (WebSocket close) is registered on engine dispose.
-
-### Example: Serial Port Game Controller
-
-A serial-connected Arduino sends joystick data, game code reads it as component data.
-
-```typescript
-import { defineComponent, defineSystem, query, Types } from '@nova/core';
-import { NativePlugin, defineNativeClient, NativeBridge } from '@nova/native';
-import type { SerialService } from '../services/serial.service';
-
-const Serial = defineNativeClient<typeof SerialService>({ name: 'serial' });
-
-const SerialJoystick = defineComponent({ x: Types.f32, y: Types.f32 });
-const SerialConnected = defineComponent({});
-
-const SerialConnectSystem = defineSystem({
-  name: 'SerialConnect',
-  query: query(SerialJoystick).not(SerialConnected),
-  resources: { read: [NativeBridge] },
-  execute({ entities, resources, commands }) {
-    const bridge = resources.get(NativeBridge);
-    if (!bridge.available) return;
-    for (const eid of entities) {
-      bridge.call(Serial, 'open', { path: 'COM3', baudRate: 9600 });
-      commands.add(eid, SerialConnected, {});
-    }
-  },
-});
-
-const SerialDataSystem = defineSystem({
-  name: 'SerialData',
-  query: query(SerialJoystick, SerialConnected),
-  events: { read: [NativeStream] },
-  execute({ entities, events }) {
-    for (const evt of events.read(NativeStream)) {
-      if (evt.service !== 'serial' || evt.event !== 'data') continue;
-      const [x, y] = (evt.data as string).split(',').map(Number);
-      for (const eid of entities) {
-        SerialJoystick.x[eid] = x;
-        SerialJoystick.y[eid] = y;
-      }
-    }
-  },
-});
-```
+Full design details will be specified when this feature enters active development
 
 ---
 
@@ -1910,6 +1397,10 @@ const PlayerPrefab = definePrefab('Player', {
   ],
 });
 ```
+
+#### Prefab Inheritance (`extends`) — v1.1
+
+> **Phasing note:** v1 ships flat prefabs with spawn-time overrides (the `definePrefab` + `world.spawn(Prefab, overrides)` pattern above). `extends` and `includes` are v1.1 features — the design is captured here for completeness, but implementation is deferred until flat prefabs prove insufficient.
 
 #### Prefab Inheritance (`extends`)
 
@@ -2070,6 +1561,8 @@ Scene files are JSON documents that describe a collection of entities:
 }
 ```
 
+**Scene versioning:** The `engineVersion` field records which engine version created the file. On load, the scene loader compares it against the current engine version. If the versions differ, any registered scene migrations run in order (oldest-first) to transform the JSON before entity spawning. Migrations are pure functions: `(sceneJson: object, fromVersion: string) => object`. In strict/pedantic error mode, a missing `engineVersion` field emits a warning. This keeps the migration system simple — no schema registry, just an ordered list of transform functions.
+
 When a scene references a prefab, only the **overridden fields** are stored in the scene file.
 This keeps scene files small and means updating a prefab definition automatically updates all instances that haven't overridden that field.
 
@@ -2132,6 +1625,8 @@ The `EditorOnly` tag component marks entities that exist only in development mod
 ---
 
 ## 13. Visual Editor (In-Line Editing)
+
+> **Phasing note:** The visual editor is Phase 3 scope. v1 ships with a basic entity inspector (view/edit component values in real-time) and system profiler as part of `@nova/devtools`. The full visual editor with round-trip file persistence, viewport gizmos, and prefab editing is a Phase 3 deliverable. The design below captures the full vision.
 
 ### Design Goal
 
@@ -2252,7 +1747,7 @@ const engine = new Engine({
   height: 600,
   editor: true,              // enables visual editor panels + scene persistence
   maxSubstepsPerFrame: 4,    // cap fixed update accumulator (see §18)
-  errorMode: 'lenient',      // 'lenient' | 'strict' | 'pedantic' (see §18.4)
+  errorMode: 'dev',           // 'dev' | 'production' (see §18.4)
 });
 
 // Or via URL parameter:  ?editor=true
@@ -2279,9 +1774,13 @@ const MenuState = defineState({
   scene: 'assets/scenes/menu.nova.json',
   onEnter({ engine }) {
     // Called when this state becomes the active (top-of-stack) state
+    // Insert state-scoped resources here
+    engine.world.insertResource(MenuData, { selectedIndex: 0 });
   },
   onExit({ engine }) {
     // Called when this state is removed from the stack
+    // Clean up state-scoped resources here
+    engine.world.removeResource(MenuData);
   },
 });
 
@@ -2308,7 +1807,7 @@ All systems are globally registered via `addStage()` / `addSystem()` and run eve
 ```typescript
 const MenuInputSystem = defineSystem({
   name: 'MenuInput',
-  resourceReads: [StateStack, InputState],
+  resources: { read: [StateStack, InputState], write: [] },
   execute({ resources }) {
     const states = resources.get(StateStack);
     if (states.current.name !== 'Menu') return;
@@ -2318,9 +1817,9 @@ const MenuInputSystem = defineSystem({
 
 const PlayerMovementSystem = defineSystem({
   name: 'PlayerMovement',
-  resourceReads: [StateStack],
-  writes: [Position, Velocity],
-  execute({ resources, query }) {
+  query: query(Position, Velocity).write(Position, Velocity),
+  resources: { read: [StateStack], write: [] },
+  execute({ entities, resources }) {
     const states = resources.get(StateStack);
     if (states.current.name !== 'Playing') return;
     // ... gameplay movement logic
@@ -2403,8 +1902,14 @@ For worlds larger than the viewport, efficient spatial queries are critical for 
 import { SpatialIndex } from '@nova/core';
 
 const spatial = world.getResource(SpatialIndex);
-const nearby = spatial.query(new AABB(x - 100, y - 100, x + 100, y + 100));
-// Returns entity IDs within the bounding box
+
+// Caller-owned result buffer — zero allocation per query
+const results = new Uint32Array(256);           // reuse across frames
+const count = spatial.queryAABB(x - 100, y - 100, x + 100, y + 100, results);
+for (let i = 0; i < count; i++) {
+  const eid = results[i];
+  // ... process nearby entity
+}
 ```
 
 The spatial index is automatically maintained by a `SpatialIndexSystem` that runs in the dedicated `spatial` stage (immediately after `physics`, before `post-physics`). It reads `Position` and optionally `AABB`/`Collider` for bounds. Because physics is the last stage that modifies positions, all subsequent stages — `post-physics`, `gameplay`, and `render-prep` — see current-frame spatial data.
@@ -2948,30 +2453,29 @@ const ERRORS = {
 
 ### 18.4 Error Modes
 
-The engine supports three error modes, controlling how non-fatal issues are surfaced:
+The engine supports two error modes, controlling how non-fatal issues are surfaced:
 
 ```typescript
 const engine = new Engine({
-  errorMode: 'lenient',    // default for `nova dev`
-  // or: 'strict'           // default for `nova build`
-  // or: 'pedantic'         // opt-in for CI/testing
+  errorMode: 'dev',       // default for `nova dev`
+  // or: 'production'     // default for `nova build`
 });
 ```
 
-| Behavior | Lenient | Strict | Pedantic |
-|----------|---------|--------|----------|
-| Asset 404 | Use fallback, log to Diag | Use fallback, emit `EngineWarning` | `engine.halt()` |
-| Unknown component in scene | Skip, log | Skip, emit `EngineWarning` | Halt |
-| Event ring overflow | Overwrite oldest | Overwrite, emit warning | Halt |
-| Arena >90% at startup | Log | Emit warning | Halt |
-| Stale entity handle used | No-op | No-op, log to Diag | Halt |
-| Config validation (post-start) | Log, use default | Emit warning, use default | Halt |
+| Behavior | Dev | Production |
+|----------|-----|------------|
+| Asset 404 | Use fallback, log warning to console + Diag | Use fallback, emit `EngineWarning` event |
+| Unknown component in scene | Skip, log warning | Skip, emit `EngineWarning` |
+| Event ring overflow | Grow buffer once, log warning | Overwrite oldest, emit warning |
+| Arena >90% at startup | Log warning | Emit warning |
+| Stale entity handle used | Log to Diag | No-op |
+| Config validation (post-start) | Log, use default | Use default, emit warning |
 
-**Lenient** is for prototyping — things just work, missing assets get placeholders, the game keeps running.
+**Dev** is for development and prototyping — things just work, missing assets get placeholders, warnings go to console and Diag ring.
 
-**Strict** is for production — fallbacks are still used, but `EngineWarning` events are emitted so game code can respond (show retry UI, degrade gracefully).
+**Production** is for shipping — fallbacks are still used, but `EngineWarning` events are emitted so game code can respond (show retry UI, degrade gracefully). Console logging is minimized.
 
-**Pedantic** is for CI — any issue halts the engine. Run tests in pedantic mode to catch problems that lenient mode silently handles.
+> A third mode (pedantic — halt on any warning) may be added later if CI testing patterns demand it.
 
 ### 18.5 APIs That Return Results
 
@@ -2980,7 +2484,7 @@ Only these APIs require error checking. Everything else is infallible by constru
 | API | Returns | Failure Reason |
 |-----|---------|----------------|
 | `app.registerComponent()` | `Result<void, EngineError>` | Arena allocation exceeded |
-| `world.spawn()` | `Result<Entity, EngineError>` | `maxEntities` reached |
+| `world.trySpawn()` | `Result<Entity, EngineError>` | `maxEntities` reached |
 | `loadManifest()` | `Result<ManifestAssets, AssetLoadReport>` | Network/parse failures |
 | `loadScene()` | `Result<SceneHandle, AssetLoadReport>` | Network/parse/unknown component |
 | `pool.submit()` | `TaskTicket` (status field) | Pool exhausted, worker crashed |
@@ -3125,7 +2629,7 @@ import {
   defineState, query, loadScene, Types, StatePlugin,
 } from '@nova/core';
 import { RendererPlugin, Sprite } from '@nova/renderer-webgpu';
-import { InputPlugin, InputState } from '@nova/input';
+import { InputPlugin, InputState, compositeAxis } from '@nova/input';
 
 // Components
 const Position = defineComponent({ x: Types.f32, y: Types.f32 });

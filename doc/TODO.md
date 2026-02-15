@@ -23,13 +23,7 @@ Files: `packages/core/src/spatial/{types,UniformGrid,Quadtree,index}.ts`
 
 **Persistent State** (`@nova/persist`) — SQLite-backed continuous state mirroring with snapshot-based save/load. The SoA arena's typed arrays map directly to SQLite BLOBs via `memcpy` — zero serialization. Background sync via `defineJob`, dirty tracking via scheduler write-sets, named snapshots for save points, crash recovery from live DB state. Cross-platform: `better-sqlite3` (local), `wa-sqlite` + OPFS (web), `@libsql/client` for Turso cloud saves. No existing game engine persistence library combines SoA-native blob storage with continuous mirroring and embedded cloud sync.
 
-**Network Serializer** (`@nova/net`) — Custom binary format for ECS state replication. Evaluated `flatbuffers` and `@msgpack/msgpack`; neither fits. Flatbuffers requires a native schema compiler, cannot return typed array views on decode (issue #8450 closed as "not planned"), and its Builder allocates. Msgpack adds ~25% framing overhead and parses sequentially — and the non-real-time cases (RPC, lobby, debug) are fine with built-in JSON. Game industry universally uses custom binary for real-time state (Unity DOTS Netcode, Quake III, bitECS). HyperNova's SoA data is already in contiguous typed arrays — serialization is essentially memcpy with a thin header. Custom format enables zero-allocation delta compression (change bitmask + scatter/gather) and integrated quantization (f32→u16) in a single pass.
-- **Wire format sketch:**
-  - Packet header: magic(u8) + type(u8) + sequence(u16) + baseline(u16) + tick(u32) + component_count(u8) = 11 bytes
-  - Per-component block: component_id(u16) + flags(u8) + entity_count(u16) + field_descriptors + entity_ids(Uint32Array) + raw field data
-  - Delta mode: change bitmask (bitfield when >10% changed, index list otherwise) + only changed entity data
-  - Quantization: per-field scale/offset, f32→u16 for positions (50% bandwidth savings at 0.1-unit precision)
-  - Non-real-time messages (RPC, lobby, debug inspector) use built-in JSON
+**Network Serializer** (`@nova/net`) — v1 uses JSON for snapshot serialization (simple, debuggable). Custom binary format deferred to v2 — SoA data is already in contiguous typed arrays, so the migration path (memcpy with thin header, delta bitmasks, f32→u16 quantization) is natural. Non-real-time messages (RPC, lobby, debug) will always use JSON.
 
 
 ## Evaluate before building
@@ -93,24 +87,14 @@ It is a general malloc/free allocator on a **fixed-size** `ArrayBuffer` — no E
 - [ ] `@nova/tilemap`: Tiled/LDtk import, GPU-instanced rendering
 - [ ] `@nova/particles`: GPU particle simulation
 - [ ] `@nova/ui`: Layout engine, widgets, interaction
-- [ ] `@nova/net`: Snapshot serialization, clock sync
+- [ ] `@nova/net`: Snapshot serialization (JSON v1, custom binary v2), clock sync
 - [ ] `@nova/workers`: Worker pool, jobs, streams
-- [ ] `@nova/native`: `defineNativeService` / `defineNativeClient` APIs + typed wire protocol
-- [ ] `@nova/native`: WebSocket bridge (server-side ServiceRegistry + client-side NativeBridge resource)
-- [ ] `@nova/native`: `NativeSyncSystem`, `NativeResultBuffer`, ECS event integration (`native:result`, `native:event`)
-- [ ] `@nova/native`: `NativePlugin` registration + graceful degradation on web target
-- [ ] `@nova/persist`: `PersistDriver` interface + in-memory driver (testing)
-- [ ] `@nova/persist`: SQL schema creation, migration, column metadata registration
-- [ ] `@nova/persist`: Dirty column tracking via scheduler write-sets (`PersistMarkSystem`)
-- [ ] `@nova/persist`: Background sync job (`defineJob` worker) — BLOB writes in transaction
-- [ ] `@nova/persist`: Snapshot save (force-sync + bulk copy live → snapshot tables)
-- [ ] `@nova/persist`: Snapshot load (read BLOBs + bulk `TypedArray.set()` restore + query cache invalidation)
-- [ ] `@nova/persist`: Snapshot management (list, delete, prune by `maxSnapshots`)
-- [ ] `@nova/persist`: `PersistPlugin` factory, stage registration, event definitions
-- [ ] `@nova/persist`: `better-sqlite3` driver (local target, runs in `defineJob` worker)
-- [ ] `@nova/persist`: `wa-sqlite` + OPFS driver (web target, `OPFSCoopSyncVFS` in worker)
-- [ ] `@nova/persist`: `@libsql/client` driver (Turso embedded replicas for cloud saves)
-- [ ] `@nova/persist`: Crash recovery detection + `CrashRecoveryAvailable` event
+- [ ] `@nova/native`: Design sketch only in v1 spec — full implementation deferred (see SPEC.md §10.5)
+- [ ] `@nova/persist`: v1 scope: bulk typed array snapshots stored in IndexedDB (web) / filesystem (local)
+- [ ] `@nova/persist`: `PersistPlugin` factory, `PersistStore` resource, save/load/quickSave/quickLoad/list/delete API
+- [ ] `@nova/persist`: IndexedDB backend (web), filesystem backend (local), in-memory backend (testing)
+- [ ] `@nova/persist`: Component persistence control (`{ persist: false }` opt-out)
+- [ ] `@nova/persist`: `SaveCompleted` / `LoadCompleted` events
 - [ ] `@nova/renderer-webgpu`: WebGL2 fallback backend
 
 ## Phase 5 — Packaging & Distribution
