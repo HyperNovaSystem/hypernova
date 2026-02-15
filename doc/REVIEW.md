@@ -123,15 +123,72 @@ Severity: Low
 Line 382: "A 1000x1000 tilemap renders in a single draw call." That's 1M tile instances. Even with GPU instancing, uploading 1M instance transforms (16 bytes each minimum = 16 MB) per frame is expensive. The spec should clarify whether frustum culling is applied (only submit visible tiles) or if this is truly 1M instances per draw call.
 
 Minor Issues
-22. compositeAxis Name Not Imported
-The minimal example (line 1956) uses compositeAxis('KeyA', 'KeyD', 'KeyW', 'KeyS') but the import only includes items from @nova/core. compositeAxis should come from @nova/input.
-23. The Output Phase is Mentioned Once
-Line 62 mentions an "Output" phase for haptics, sound, and side effects, but it never appears in any stage ordering or system scheduling example. It's unclear whether this is a formal stage or just a conceptual label.
+22. compositeAxis Name Not Imported — **RESOLVED: import added to @nova/input in minimal example**
+23. The Output Phase is Mentioned Once — **RESOLVED: clarified as not a separate stage; side effects run within gameplay stages**
 24. WebGPU Availability Statement is Dated
 Line 598: "WebGPU availability (as of 2025) is strong on Chrome and Edge, growing on Firefox and Safari." This will age; consider removing the year reference or making it a footnote.
 25. 20 KB Core Bundle Target is Aggressive
 The @nova/core package includes: ECS world, archetype storage, generational IDs, entity hierarchy, system scheduler with dependency-graph analysis, game loop, event bus, math library (Vec2, Mat3, AABB, Color + utilities), typed resources, scene loading, prefab instantiation, AND spatial index — all under 20 KB gzipped. For reference, bitecs (SoA-only, no scheduler/math/scenes) is ~5 KB. The target may be achievable but should be validated with a prototype before committing to it as a published target.
 
+---
+
+## Review Pass 2 — Inconsistencies, Over-Engineering, and Gaps
+
+### Inconsistencies Resolved
+
+**A1. `world.spawn()` return type:** Resolved. `spawn()` returns `Entity` directly (halts on maxEntities). `trySpawn()` returns `Result<Entity>`. Builder pattern (`.add().withChild()`) chains on `spawn()`.
+
+**A2. System resource declaration shape:** Resolved. Canonical form is `resources: { read: [...], write: [...] }`. Fixed §14 examples that used `resourceReads`/`writes`.
+
+**A3. `compositeAxis` import:** Resolved. Import corrected to `@nova/input` in Appendix A.
+
+**A4. Spatial index query API:** Resolved. Canonical API is zero-alloc caller-owned buffer: `queryAABB(minX, minY, maxX, maxY, results: Uint32Array): count`.
+
+**A5. Asset consumption model:** Resolved. `loadManifest` returns `Result<ManifestAssets>` (all ready). Individual/streamed assets use `AssetHandle<T>` with status/value/fallback. Both patterns documented.
+
+**A6. Scene versioning:** Resolved. `engineVersion` field documented with migration strategy: ordered transform functions `(sceneJson, fromVersion) => object`.
+
+**A7. Animation state machine `eid` closure:** Resolved. Transition conditions receive entity ID as parameter: `when: (eid) => Math.abs(Velocity.x[eid]) > 0.1`.
+
+**A8. Output phase:** Resolved. Clarified as not a separate stage — side effects run within gameplay stages (`gameplay` or `post-physics`).
+
+### Over-Engineering Addressed
+
+**B1. `@nova/persist` descoped:** SQLite continuous mirroring, 3 platform drivers, cloud saves, crash recovery, time-travel debugging, and editor undo/redo all deferred to v2+. v1 uses simple bulk typed array snapshots stored in IndexedDB (web) or filesystem (local).
+
+**B2. `@nova/native` deferred:** Full §10.5 compressed to a design sketch. Marked as Phase 4+ / Future. Core engine does not depend on it.
+
+**B3. Custom network serializer deferred:** v1 uses JSON for snapshot serialization. Custom binary format with delta compression deferred until profiling of JSON path informs the design.
+
+**B4. Prefab inheritance phased:** v1 ships flat prefabs with spawn-time overrides. `extends` and `includes` deferred to v1.1.
+
+**B5. Error modes reduced:** Three modes (lenient/strict/pedantic) reduced to two: `dev` (verbose + fallbacks) and `production` (emit events + fallbacks). Pedantic may be added later for CI.
+
+**B6. Visual editor phased:** Full visual editor with round-trip persistence is Phase 3. v1 ships entity inspector + system profiler in `@nova/devtools`.
+
+### Gaps Filled
+
+**C1. Transform model:** Resolved. `Position` is always local (relative to parent, or world-space if no parent). `WorldTransform` (absolute) is computed by `TransformPropagationSystem`. Renderer reads `WorldTransform`. Gameplay reads/writes `Position`.
+
+**C2. `maxEntities` config:** Added to Engine config with default 50,000.
+
+**C3. `RenderOrder` component:** Defined as `{ layer: Types.i32 }` built-in from `@nova/renderer-webgpu`. Lower layer draws first.
+
+**C4. State resource cleanup:** Resolved via `onEnter`/`onExit` lifecycle hooks — `insertResource` in `onEnter`, `removeResource` in `onExit`.
+
+**C5. Tag component storage:** Clarified: `defineComponent({})` allocates zero bytes in the arena, tracked by archetype bitmask only.
+
+**C6. String interning lifecycle:** Documented. StringTable grows monotonically — interned strings are never freed. Bounded by content for typical use (entity names, prefab IDs). Recommendation: use `Map<Entity, string>` resource for frequently-changing unique strings.
+
+**C7. Write declaration API:** Canonicalized. Component access declarations live on the query: `query(...).read(...).write(...)`. No separate top-level `reads`/`writes` fields.
+
+**C8. Renderer Transform reference:** Fixed. Renderer reads `WorldTransform` (not `Transform`), `Sprite`, `RenderOrder`, `TilemapLayer`, and `Camera`.
+
+### Remaining Open Items
+- WebGPU year reference (#24) — cosmetic, fix when spec is next edited
+- 20 KB core bundle target (#25) — validate with Phase 1 prototype
+- Transform propagation optimization (#20) — address during implementation
+- Tilemap frustum culling (#21) — address during @nova/tilemap implementation
+
 Summary by Severity
-SeverityCountKey ItemsCritical0~~Entity ID vs. archetype SoA access pattern (#1)~~ — RESOLVEDHigh3~~Entity bit packing (#2)~~ RESOLVED, ~~string types in SoA (#6)~~ RESOLVED, ~~arena fallback (#7)~~ MITIGATED, plugin API (#8), ~~archetype fragmentation (#15)~~ ELIMINATED, spatial index staleness (#16)Medium6~~Event API inconsistency (#3)~~ RESOLVED, resource access (#4), ~~error handling (#9)~~ RESOLVED, save/load (#10), scene versioning (#11), ~~state system interaction (#14)~~ RESOLVED, change detection (#17), ~~zero-alloc events (#18)~~ RESOLVED, ~~query overhead (#19)~~ SIMPLIFIEDLow6Stage ordering (#5), prefab inheritance (#12), render order (#13), transform propagation (#20), tilemap claim (#21), minor issues (#22–25)
-The adoption of global SoA (column-per-field) storage with archetype bitmask query resolution resolves issues #1, #2, #7, #15, and #19. The unified `defineEvent` API with ring-buffered storage resolves issues #3 and #18. String interning via global StringTable resolves issue #6. Error handling strategy (§18) resolves issue #9. The resource-guard state model (systems check `StateStack` resource, no per-state system injection) resolves issue #14. The remaining highest-priority issues are: plugin API (#8) and spatial index staleness (#16).
+All critical and high-severity items from Pass 1 are resolved. All Pass 2 inconsistencies (A1–A8) are resolved. Over-engineering items (B1–B6) are addressed via phasing and scope reduction. Gaps (C1–C8) are filled. The spec is ready for Phase 1 implementation.
