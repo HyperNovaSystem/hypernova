@@ -18,7 +18,7 @@ For worlds larger than the viewport, efficient spatial queries are critical for 
 
 `@nova/core` provides:
 
-- **Uniform grid** — O(1) insertion/removal, O(neighbors) query. Best for entities of similar size. Default for most games.
+- **Uniform grid** — O(1) insertion/removal, O(neighbors) query. Best for entities of similar size. Default for most simulations.
 - **Quadtree** (optional) — better for worlds with entities of wildly varying sizes.
 
 ```typescript

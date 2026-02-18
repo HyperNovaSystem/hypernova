@@ -4,14 +4,20 @@
 
 ## Overview
 
-The local exe target (see [Packaging & Distribution](./18-packaging.md)) runs a Node.js server process. `@nova/native` provides a typed WebSocket bridge between browser game code and native Node.js modules (serial ports, GPIO, USB HID, filesystem) running in the server process. On the web target it degrades gracefully — `NativeBridge.available` is `false` and calls return immediately-rejected tickets.
+`@nova/native` provides a typed bridge between browser-side simulation code and native Node.js / Electron modules (serial ports, GPIO, USB HID, filesystem, native windows). The transport layer depends on the deployment target:
+
+| Target | Transport | Notes |
+|--------|-----------|-------|
+| **Electron** | Electron IPC (`contextBridge`) | Fastest — direct process communication, no network |
+| **Local (.exe)** | WebSocket to embedded Node.js server | Same-machine localhost, ~0.1ms latency |
+| **Web** | Graceful degradation | `NativeBridge.available` is `false`, calls return immediately-rejected tickets |
 
 ## Design Sketch
 
-- **Server:** `defineNativeService({ name, init, methods, dispose })` — async methods callable from game code, `emit()` for streaming data to browser
+- **Server / Main Process:** `defineNativeService({ name, init, methods, dispose })` — async methods callable from simulation code, `emit()` for streaming data to renderer process
 - **Client:** `defineNativeClient<T>({ name })` — typed proxy, calls return `NativeTicket` (not Promise), results arrive via `NativeResult` / `NativeStream` events
 - **ECS integration:** `NativeSyncSystem` drains results in a `native-sync` stage (after `worker-sync`), same pattern as `@nova/workers`
 - **Wire protocol:** JSON text frames for control, binary frames with 4-byte header for high-frequency data
-- **Graceful degradation:** On web target, `NativeBridge.available` is `false`, calls return immediately-rejected tickets
+- **Electron optimization:** When running in Electron, the bridge uses `ipcRenderer.invoke()` / `ipcMain.handle()` instead of WebSocket — no serialization overhead for structured-cloneable data
 
 Full design details will be specified when this feature enters active development.

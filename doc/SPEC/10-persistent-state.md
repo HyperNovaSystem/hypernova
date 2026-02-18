@@ -9,9 +9,9 @@ No per-entity traversal, no serialization.
 
 ## Core Design
 
-**Save** = copy each persistent component's typed array into a snapshot blob. For a game with 20 component fields and 50K entities: 20 bulk copies, not 50K entity walks.
+**Save** = copy each persistent component's typed array into a snapshot blob, plus the PRNG seed from the `Random` resource. For a simulation with 20 component fields and 50K entities: 20 bulk copies, not 50K entity walks.
 
-**Load** = restore snapshot blobs into the arena's typed arrays + invalidate query caches.
+**Load** = restore snapshot blobs into the arena's typed arrays + restore PRNG seed + invalidate query caches. The simulation resumes deterministically from the saved state.
 
 ```typescript
 // Save
@@ -57,8 +57,9 @@ interface PersistStore {
 | Target | Backend | Notes |
 |--------|---------|-------|
 | Web | IndexedDB | Blob storage, works everywhere |
+| Electron | Filesystem (via IPC) | Same as local, accessed through preload bridge |
 | Local (Node.js) | Filesystem (JSON + binary blobs) | Simple file-based snapshots |
-| Testing | In-memory | No persistence, fast tests |
+| Testing / Headless | In-memory | No persistence, fast tests and batch runs |
 
 ## Plugin Configuration
 

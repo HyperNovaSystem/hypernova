@@ -1,6 +1,6 @@
-# HyperNova Engine — A Modern TypeScript Game Engine
+# HyperNova Engine — A Modular Simulation Engine for the Modern Web
 
-> A modular, ECS-first, WebGPU-powered 2D game engine built for the modern web.
+> An ECS-first, WebGPU-powered simulation engine built for browsers and Electron — equally suited to games, interactive simulations, and data-driven visualizations.
 
 ---
 
@@ -8,17 +8,17 @@
 
 ### Core Design
 
-1. [Design Philosophy](./01-design-philosophy.md) — Composition over inheritance, ship only what you use, DX as a feature
-2. [Architecture Overview](./02-architecture-overview.md) — Game loop, package boundary rules, dependency graph
+1. [Design Philosophy](./01-design-philosophy.md) — Simulation-first, composition over inheritance, ship only what you use, DX as a feature
+2. [Architecture Overview](./02-architecture-overview.md) — Simulation loop, headless mode, time control, package boundary rules
 
 ### Engine Core
 
 3. [ECS-First Architecture](./03-ecs-architecture.md) — Entities, components, systems, queries, scheduling, resources, hierarchy
-4. [Modular Package System](./04-package-system.md) — `@nova/core`, renderer, physics, input, audio, assets, tilemap, particles, animation, UI, net, devtools
+4. [Modular Package System](./04-package-system.md) — `@nova/core`, renderer, physics, input, audio, assets, tilemap, particles, animation, UI, net, recorder, devtools
 
 ### Rendering & Type System
 
-5. [Renderer — WebGPU First](./05-renderer.md) — WebGPU, fallback strategy, render pipeline, custom materials
+5. [Renderer — WebGPU First](./05-renderer.md) — WebGPU, fallback strategy, render pipeline, compute shaders, custom materials
 6. [TypeScript From the Ground Up](./06-typescript.md) — Type safety, events, generic components, build tooling
 
 ### Simulation
@@ -38,7 +38,7 @@
 
 ### Authoring & DX
 
-13. [Developer Experience](./13-developer-experience.md) — HMR, devtools panel, CLI
+13. [Developer Experience](./13-developer-experience.md) — HMR, devtools panel, parameter tuning, CLI
 14. [Scenes, Prefabs & Serialization](./14-scenes-prefabs.md) — Prefabs, inheritance, scene files, ECS integration
 15. [Visual Editor](./15-visual-editor.md) — In-line editing, architecture, round-trip persistence
 
@@ -46,7 +46,7 @@
 
 16. [Game States & Scene Transitions](./16-game-states.md) — State machine, resource guard pattern, transitions
 17. [Performance Discipline](./17-performance.md) — Zero allocations per frame, spatial indexing
-18. [Packaging & Distribution](./18-packaging.md) — Web target, local server target, export configuration
+18. [Packaging & Distribution](./18-packaging.md) — Web target, Electron target, local server target, export configuration
 
 ### Engine Framework
 
@@ -55,7 +55,7 @@
 
 ### Appendices
 
-- [Appendix A: Minimal Example](./appendix-a-examples.md) — Code-based and scene-based bootstrap
+- [Appendix A: Minimal Example](./appendix-a-examples.md) — Headless simulation and browser-rendered variants
 - [Appendix B: Comparison with Existing Frameworks](./appendix-b-comparison.md)
 - [Appendix C: Target Performance Budgets](./appendix-c-performance-budgets.md)
 - [Appendix D: Future — Parallel System Execution](./appendix-d-parallel-execution.md)

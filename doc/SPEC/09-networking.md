@@ -6,7 +6,7 @@ HyperNova doesn't impose a networking architecture.
 Instead, it provides primitives that support common patterns:
 
 **Authoritative Server (Client-Server)**
-- Server runs the ECS world as the source of truth.
+- Server runs the ECS world as the source of truth (headless mode, no renderer).
 - Clients send inputs, receive state snapshots.
 - `@nova/net` provides snapshot serialization, delta compression, and interpolation.
 
@@ -14,7 +14,7 @@ Instead, it provides primitives that support common patterns:
 - Each peer runs a local simulation.
 - Inputs are exchanged and applied retroactively.
 - `@nova/net` provides world state save/restore, input buffer management, and resimulation helpers.
-- Rapier's determinism makes rollback reliable.
+- Rapier's determinism + seeded PRNG (`Random` resource) makes rollback reliable.
 
 ## Snapshot Serialization
 
