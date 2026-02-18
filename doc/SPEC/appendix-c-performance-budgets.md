@@ -2,7 +2,7 @@
 
 | Metric | Target |
 |---|---|
-| Core bundle (gzipped) | < 20 KB |
+| Core bundle (gzipped) | < 25 KB |
 | Full engine (all packages, gzipped) | < 180 KB |
 | 10,000 sprites @ 60 FPS | ✓ desktop, ✓ mobile |
 | 100,000 particles @ 60 FPS | ✓ WebGPU, degraded WebGL2 |

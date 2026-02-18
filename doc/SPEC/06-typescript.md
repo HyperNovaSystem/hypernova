@@ -77,7 +77,28 @@ Event data is stored in pre-allocated ring buffers — zero heap allocation in s
 const HighFreqEvent = defineEvent<{ value: number }>({ capacity: 1024 });
 ```
 
-Default capacity: 256. Overflow in debug mode logs a warning and grows the buffer (one-time allocation); in production, oldest events are overwritten.
+Default capacity: 256. Overflow behavior is configurable per event type:
+
+```typescript
+const SimCriticalEvent = defineEvent<{ tick: number }>({
+  capacity: 512,
+  overflow: 'grow',        // default in dev: grow buffer, log warning
+});
+
+const TelemetryEvent = defineEvent<{ value: number }>({
+  capacity: 1024,
+  overflow: 'drop-oldest', // production default: overwrite oldest
+});
+
+const DeterministicEvent = defineEvent<{ state: number }>({
+  capacity: 256,
+  overflow: 'halt',        // halt the engine — for events that must not be lost
+});
+```
+
+- `'grow'` — grows the buffer (one-time allocation, logs warning). Default in dev mode.
+- `'drop-oldest'` — overwrites the oldest events. Default in production mode.
+- `'halt'` — calls `engine.halt()` with a fatal error. Use for simulation-critical events where data loss would break determinism.
 
 ### External Observation (Devtools Only)
 

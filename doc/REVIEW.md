@@ -1,194 +1,396 @@
-Architectural Contradictions
-1. Entity ID vs. SoA Access Pattern — Fundamental Design Conflict
+# HyperNova Engine — Architecture Review
+
+## Review Pass 1 — Architectural Contradictions (Historical)
+
+All items from the original review are preserved below for traceability. Status tags indicate resolution.
+
+### Architectural Contradictions
+
+**1. Entity ID vs. SoA Access Pattern — Fundamental Design Conflict**
 Severity: Critical — **RESOLVED: adopted global SoA (column-per-field) with archetype query resolution**
-The spec contained a fundamental contradiction between its two core storage claims:
 
-Claim A (line 100): Entities are generational identifiers — a u32 index packed with a u16 generation counter (48 bits total).
-Claim B (lines 143–149): Components use archetype-based Struct-of-Arrays. Entities sharing the same component set are grouped into an archetype, with each field stored as a contiguous typed array within that archetype.
-Claim C (lines 168–171): System code accesses data as Position.x[eid] — direct array indexing by entity ID.
+The spec contained a fundamental contradiction between its two core storage claims. Resolved by choosing global SoA (bitecs-style): `Position.x[eid]` works directly, archetypes are bitmasks for query resolution only, not storage containers.
 
-These three claims are mutually exclusive. In archetype storage, Position.x is a per-archetype Float32Array indexed by the entity's row within that archetype, not by global entity ID. Entity 42 might be at row 7 in archetype [Position, Velocity]. Position.x[42] would access the wrong data (or out-of-bounds).
-The only way Position.x[eid] works with direct entity IDs is the bitecs model: one global Float32Array for each field, sized to maxEntities, indexed by entity ID. This is sparse/semi-dense storage, not archetype-grouped storage.
-You must choose one:
-
-Global SoA (bitecs-style): Position.x[eid] works. No archetypes. Iteration requires a bitfield/sparse set per query. Cache locality is good within a single component but not across components.
-Archetype SoA: Dense, cache-friendly iteration across related components. But access requires Position.x[archetype.row(eid)] or an entity→row lookup table. The Position.x[eid] syntax does not work.
-
-A hybrid is possible (global dense arrays with archetype-based iteration tracking), but the spec doesn't describe one. This affects every code example in the document.
-2. Entity ID Bit Packing is Unresolvable
+**2. Entity ID Bit Packing**
 Severity: High — **RESOLVED: u32 index for array access, generation stored separately in Uint16Array, handle packing via `(gen << 20) | index`**
-A u32 index (4 bytes) + u16 generation (2 bytes) = 48 bits. The spec doesn't say how these are packed. Options:
 
-Into a u64 — JavaScript doesn't have native u64; requires BigInt (slow, allocates) or two separate u32 fields.
-Into a single u32 — only possible by splitting bits (e.g., 20-bit index + 12-bit generation), limiting max entities to ~1M and generation wrap to 4096.
+### API Inconsistencies
 
-If entity IDs are used as array indices (Position.x[eid]), the ID must be an integer that fits as a typed array index. A packed 48-bit value can't be used directly.
+**3. Three Different Event APIs**
+Severity: Medium — **RESOLVED: unified `defineEvent<T>()` type tokens with pull-based `events.read()` / `events.emit()`**
 
-API Inconsistencies
-3. Three Different Event APIs
-Severity: Medium — **RESOLVED: unified `defineEvent<T>()` type tokens with pull-based `events.read()` / `events.emit()` in systems; stage-boundary double-buffered ring buffers; `world.on()` removed from core (replaced by `engine.observe()` for devtools only)**
+**4. Three Different Resource Access Patterns**
+Severity: Medium — **RESOLVED: type-token keyed via `resources.get(Token)` everywhere**
 
-Section 3 (line 247): Events described as "typed, synchronous within a frame."
-Section 6 (lines 648–657): Events use discriminated unions with world.on('collision', ...) — callback-based, stringly-typed despite claiming no string keys.
-Section 7 (lines 721–722): Systems use events.get('collision-start') — pull-based iteration via system context, string-keyed.
+**5. Stage Set Varies Across Sections**
+Severity: Low — **RESOLVED: canonical ordering documented in §17.5**
 
-These are three different consumption models. The spec should settle on one event API and use it consistently.
-4. Three Different Resource Access Patterns
-Severity: Medium
+### Gaps (Underspecified or Missing)
 
-world.getResource(Time) — type-token keyed, on the world object (line 305)
-resources.get(Time) — type-token keyed, on the system context (line 315)
-resources.get<WorkerPool>('workerPool') — string-keyed with generic cast (line 894)
+**6. String Component Types in SoA Storage**
+Severity: High — **RESOLVED: string interning via global StringTable**
 
-The third pattern contradicts Section 6's "typed resources, no string keys" principle.
-5. Stage Set Varies Across Sections
-Severity: Low
-The recommended stage ordering is different in each section:
+**7. Arena Fallback Invalidates All Views**
+Severity: High — **MITIGATED: column arrays allocated once at startup, resize only triggered by late defineComponent()**
 
-Section 3: input → pre-physics → physics → post-physics → gameplay → render-prep
-Section 10: input → worker-sync → pre-physics → physics → ...
-Section 10.5: input → worker-sync → native-sync → pre-physics → ...
+**8. Plugin API**
+Severity: High — **RESOLVED** — See SPEC.md §17.
 
-While these are additive (plugins add stages), the spec should present a single canonical stage ordering that includes all built-in stages.
+**9. Error Handling Strategy**
+Severity: Medium — **RESOLVED** — See SPEC.md §18.
 
-Gaps (Underspecified or Missing)
-6. String Component Types in SoA Storage
-Severity: High — **RESOLVED: string interning via global StringTable; Types.string fields backed by Uint32Array storing intern indices; index 0 reserved for empty; string resolution deferred to point-of-use**
-Scene metadata components (line 1513–1519) use Types.string:
-typescriptconst Name = defineComponent({ value: Types.string });
-const SceneEntity = defineComponent({ sceneId: Types.string, entityIndex: Types.u32 });
-Strings cannot be stored in typed arrays (Float32Array, Uint32Array, etc.). The spec doesn't explain how non-numeric types are handled in the archetype/SoA system. Options include string interning (store indices into a string table), separate heap storage per archetype, or excluding string components from the SoA arena entirely — but each has different performance and complexity implications.
-7. Arena Fallback Invalidates All Views
-Severity: High — **MITIGATED: column arrays allocated once at startup, sized to maxEntities; resize only triggered by late defineComponent(), never during gameplay**
-Line 278: "When resize() is unavailable, the arena falls back to allocate-and-copy."
-Allocating a new ArrayBuffer and copying data invalidates all existing typed array views pointing at the old buffer. Every Float32Array reference held by systems, cached by queries, or stored in component definitions becomes dangling. This is a correctness bug, not just a performance issue. The spec needs a view-invalidation strategy (e.g., indirection through a view registry, or disallowing view caching).
-8. ~~Plugin API is Undefined~~ **RESOLVED** — See SPEC.md §17.
-Severity: High → **Resolved**
-Plugin = `{ name, depends?, install(app) }`. EngineBuilder provides restricted registration API (components, resources, events, stages, systems, sub-plugins, cleanup). Dependency resolution via topological sort. Factory pattern for configurable plugins. Hot reload in dev mode. Full rationale in §17.10.
+**10. Save/Load Game Strategy**
+Severity: Medium — **RESOLVED** — `@nova/persist` added.
 
-9. ~~No Error Handling Strategy~~ **RESOLVED** — See SPEC.md §18.
-Severity: Medium → **Resolved**
-Comprehensive error handling strategy added: `Result<T, EngineError>` discriminated union at boundary APIs, three error modes (lenient/strict/pedantic), pre-allocated error singletons, `Diag` resource, `engine.halt()` for fatal errors. Per-problem resolutions: arena overflow returns `Result` from `registerComponent()`, assets use `AssetHandle<T>` with fallbacks, native bridge auto-reconnects with `'disconnected'` ticket status, worker timeouts documented with buffer loss semantics, physics accumulator capped via `maxSubstepsPerFrame` with `BudgetExceeded` events. Plugin factories remain the one place exceptions are allowed (before engine start).
+**11. Scene File Format Versioning**
+Severity: Medium — **RESOLVED: `engineVersion` field with migration transforms**
 
-10. No Save/Load Game Strategy
-Severity: Medium → **Resolved**
-`@nova/persist` added as an opt-in plugin (SPEC.md §9.5). Uses SQLite as a continuously-mirrored shadow of the SoA arena — typed array columns stored as BLOBs with zero serialization (`memcpy` in, `memcpy` out). Save = snapshot current live state (O(columns), not O(entities)). Load = restore snapshot BLOBs into typed arrays + invalidate query caches. Background sync via `defineJob` worker flushes dirty columns every N seconds. Crash recovery via live DB state. Cross-platform drivers: `better-sqlite3` (local), `wa-sqlite` + OPFS (web), `@libsql/client` for Turso cloud saves. Components persist by default; opt out via `{ persist: false }`. Resources opt in explicitly. Time-travel debugging (devtools only) reuses `@nova/net`'s change bitmask diff format.
-11. Scene File Format Lacks Versioning
-Severity: Medium
-.nova.json files (lines 1456–1486) have no version field. As the engine evolves, scene files will need migration. Without versioning, there's no way to detect which format version a file uses or apply transformations.
-12. Prefab Composition/Inheritance
-Severity: Low — **RESOLVED: prefabs support single inheritance via `extends` and multi-prefab composition via `includes`. Merge semantics are deterministic: base (recursive) → includes (left-to-right) → own declarations. Children merge by name. Component removal intentionally unsupported. Resolution at `definePrefab()` time with circular reference detection. Scene files unchanged — overrides computed against the resolved (flattened) prefab. `childOverrides` added for per-instance child component overrides. See SPEC.md §12.**
-Prefabs can have children, but can prefabs extend other prefabs? A BossPrefab based on EnemyPrefab with overrides is a common pattern. The spec doesn't address prefab inheritance or composition beyond parent-child hierarchy.
-13. Render Order Management
-Severity: Low
-The render pipeline (line 607) sorts by "layer → texture → blend mode → depth" but there's no dedicated render-order component or API. The scene file example shows a RenderOrder: { layer: -10 } component, but this component is never defined in the spec. How developers control draw order (z-index equivalent) is underspecified.
-14. State System vs. Global Systems Interaction
-Severity: Medium — **RESOLVED: resource-guard model; all systems global, state-aware systems guard on `StateStack` resource; `defineState` is lifecycle + scene only, no `systems` field. See SPEC.md §14.**
-defineState (line 1660) includes a systems array. But globally-registered systems (via engine.addStage) presumably run in all states. The spec doesn't explain:
+**12. Prefab Composition/Inheritance**
+Severity: Low — **RESOLVED: `extends` + `includes` with deterministic merge semantics**
 
-Do state systems replace global systems, or add to them?
-Are global systems paused when a state is pushed?
-How do state-specific stages interact with the global stage pipeline?
+**13. Render Order Management**
+Severity: Low — **RESOLVED: `RenderOrder` component with `layer: Types.i32`**
 
+**14. State System vs. Global Systems Interaction**
+Severity: Medium — **RESOLVED: resource-guard model**
 
-Performance Concerns
-15. Archetype Fragmentation
-Severity: High — **ELIMINATED: archetypes are bitmasks for query resolution, not storage containers; no per-archetype arrays to fragment**
-The spec doesn't discuss archetype fragmentation. Every unique combination of components creates a new archetype. If entities frequently gain/lose components (e.g., buff/debuff systems adding tag components), the number of archetypes can explode. Each archetype has its own set of typed arrays, defeating cache locality benefits. Games with rich component compositions can easily reach hundreds of archetypes, each containing only a few entities.
-Mitigation strategies (archetype merging, component grouping guidelines, archetype count limits) aren't discussed.
-16. Spatial Index Staleness
-Severity: High — **RESOLVED: SpatialIndexSystem moved to dedicated `spatial` stage immediately after `physics`; post-physics, gameplay, and render-prep all see current-frame spatial data**
-SpatialIndexSystem runs in render-prep (line 1733) — after all gameplay stages. But spatial queries are commonly needed during gameplay (AI proximity checks, area-of-effect damage, trigger zones). Systems in pre-physics, physics, post-physics, and gameplay stages would all query stale spatial data from the previous frame. For fast-moving objects, this means missed queries and phantom results.
-The spatial index should be updated at least once before gameplay systems run (e.g., in a spatial-update stage before pre-physics), or provide a way for systems to trigger incremental updates.
-17. Change Detection Overhead
-Severity: Medium — **RESOLVED: double-buffered snapshot comparison for `.changed()` queries. Per-entity precision with zero write-path impact. Snapshots allocated only for components referenced in `.changed()` queries (opt-in cost). Scheduler write-set serves as free coarse pre-filter. Comparison is O(matched entities), not O(maxEntities). Snapshot copy at frame end is a single memcpy per tracked field (~0.02ms per 200KB). Comparison utility shared with `@nova/net` delta compression and `@nova/devtools` time-travel debugging.**
-The query API supports .changed(Health) (line 199) for change detection. In SoA storage, this requires tracking every write to every component field — typically via dirty bitfields per entity per component, checked on every Position.x[eid] = ... assignment. Since component fields are raw typed array elements, there's no setter to intercept writes. This means either:
+### Performance Concerns
 
-A Proxy-based approach (expensive, defeats the typed array performance model)
-Manual marking (systems must call markChanged(eid, Health) — error-prone, not shown in spec)
-Snapshot comparison (compare current vs. previous frame — O(n) per component per frame)
+**15. Archetype Fragmentation**
+Severity: High — **ELIMINATED: archetypes are bitmasks, not storage containers**
 
-The spec shows change detection as a one-liner but doesn't address the implementation cost.
-18. Zero-Allocation Claim vs. Event Objects
-Severity: Medium — **RESOLVED: events use pre-allocated ring buffers (SoA typed arrays for numeric payloads, object-pool ring for complex payloads); no per-event allocation; cursor reset at frame boundary**
-The spec targets "zero heap allocations per frame" (line 1706) and lists pooling strategies. But events like { type: 'collision', entityA, entityB, normal, impulse } are JavaScript objects that must be created each frame. Even with object pooling, the pool-checkout/return overhead exists and pool exhaustion causes allocation. The spec should clarify whether events are truly pooled objects, ring-buffer entries, or something else.
-19. Query Overhead with Many Archetypes
-Severity: Medium — **SIMPLIFIED: query resolution is bitmask matching over entity archetype masks; no archetype table iteration**
-world.query(Position, Velocity) must find all archetypes containing both components. With N archetypes, this is O(N) per query per frame (linear scan, or O(log N) with archetype indexing). For games with many archetypes (see #15), query setup cost accumulates. The spec doesn't discuss archetype indexing strategies.
-20. Transform Propagation for Deep Hierarchies
-Severity: Low
-TransformPropagationSystem walks parent chains to compute world transforms. For hierarchies of depth D with E entities, this is O(D * E) per frame. The spec doesn't discuss optimizations (topological sort, dirty flags, breadth-first traversal with depth-indexed processing).
-21. Tilemap "Single Draw Call" Claim
-Severity: Low
-Line 382: "A 1000x1000 tilemap renders in a single draw call." That's 1M tile instances. Even with GPU instancing, uploading 1M instance transforms (16 bytes each minimum = 16 MB) per frame is expensive. The spec should clarify whether frustum culling is applied (only submit visible tiles) or if this is truly 1M instances per draw call.
+**16. Spatial Index Staleness**
+Severity: High — **RESOLVED: dedicated `spatial` stage after `physics`**
 
-Minor Issues
-22. compositeAxis Name Not Imported — **RESOLVED: import added to @nova/input in minimal example**
-23. The Output Phase is Mentioned Once — **RESOLVED: clarified as not a separate stage; side effects run within gameplay stages**
-24. WebGPU Availability Statement is Dated
-Line 598: "WebGPU availability (as of 2025) is strong on Chrome and Edge, growing on Firefox and Safari." This will age; consider removing the year reference or making it a footnote.
-25. 20 KB Core Bundle Target is Aggressive
-The @nova/core package includes: ECS world, archetype storage, generational IDs, entity hierarchy, system scheduler with dependency-graph analysis, game loop, event bus, math library (Vec2, Mat3, AABB, Color + utilities), typed resources, scene loading, prefab instantiation, AND spatial index — all under 20 KB gzipped. For reference, bitecs (SoA-only, no scheduler/math/scenes) is ~5 KB. The target may be achievable but should be validated with a prototype before committing to it as a published target.
+**17. Change Detection Overhead**
+Severity: Medium — **RESOLVED: double-buffered snapshot comparison**
+
+**18. Zero-Allocation Claim vs. Event Objects**
+Severity: Medium — **RESOLVED: pre-allocated ring buffers**
+
+**19. Query Overhead**
+Severity: Medium — **SIMPLIFIED: bitmask matching, no archetype table iteration**
+
+**20. Transform Propagation for Deep Hierarchies**
+Severity: Low — **OPEN: address during implementation**
+
+**21. Tilemap "Single Draw Call" Claim**
+Severity: Low — **OPEN: clarify frustum culling during @nova/tilemap implementation**
+
+### Minor Issues (22–25)
+All resolved or deferred. See original review text in git history.
 
 ---
 
-## Review Pass 2 — Inconsistencies, Over-Engineering, and Gaps
+## Review Pass 2 — Inconsistencies, Over-Engineering, Gaps (Historical)
 
-### Inconsistencies Resolved
+All A1–A8 inconsistencies resolved. B1–B6 over-engineering addressed via phasing. C1–C8 gaps filled. See git history for details.
 
-**A1. `world.spawn()` return type:** Resolved. `spawn()` returns `Entity` directly (halts on maxEntities). `trySpawn()` returns `Result<Entity>`. Builder pattern (`.add().withChild()`) chains on `spawn()`.
+---
 
-**A2. System resource declaration shape:** Resolved. Canonical form is `resources: { read: [...], write: [...] }`. Fixed §14 examples that used `resourceReads`/`writes`.
+## Review Pass 3 — Critical Evaluation for Simulation Builder / Game Engine
 
-**A3. `compositeAxis` import:** Resolved. Import corrected to `@nova/input` in Appendix A.
+*Focus: evaluating the SPEC against the goal of a highly capable simulation builder for browser-based or Electron-based applications.*
 
-**A4. Spatial index query API:** Resolved. Canonical API is zero-alloc caller-owned buffer: `queryAABB(minX, minY, maxX, maxY, results: Uint32Array): count`.
+The SPEC is strong as a 2D game engine design document. The ECS architecture is sound, the plugin system is well-composed, the error handling is thorough, and the phased delivery strategy is reasonable. However, several structural gaps and framing issues prevent it from being a capable *simulation builder* — a tool for constructing interactive simulations that happen to include games as a use case.
 
-**A5. Asset consumption model:** Resolved. `loadManifest` returns `Result<ManifestAssets>` (all ready). Individual/streamed assets use `AssetHandle<T>` with status/value/fallback. Both patterns documented.
+### S1. Identity Crisis: "2D Game Engine" vs. "Simulation Builder"
+Severity: **High — Structural**
 
-**A6. Scene versioning:** Resolved. `engineVersion` field documented with migration strategy: ordered transform functions `(sceneJson, fromVersion) => object`.
+The SPEC is framed exclusively as a "2D game engine." Every example is a game (platformers, bullet hells). Every decision is justified against game workloads. This framing excludes large classes of simulation that would run in a browser or Electron:
 
-**A7. Animation state machine `eid` closure:** Resolved. Transition conditions receive entity ID as parameter: `when: (eid) => Math.abs(Velocity.x[eid]) > 0.1`.
+- Agent-based models (epidemiology, traffic, ecology)
+- Training environments (RL agents, evolved behaviors)
+- Interactive data visualizations with simulated dynamics
+- Physics sandboxes and engineering simulators
+- Digital twins (factory floors, logistics, IoT)
+- Educational simulations (chemistry, astronomy, economics)
 
-**A8. Output phase:** Resolved. Clarified as not a separate stage — side effects run within gameplay stages (`gameplay` or `post-physics`).
+The ECS core is actually dimension- and domain-agnostic — the limitation is not architectural but in how the SPEC frames and constrains it. The fix is not to remove game features but to generalize the framing and add simulation-critical capabilities that games also benefit from.
 
-### Over-Engineering Addressed
+**Resolution:** Reframe HyperNova as "a modular, ECS-first simulation engine for the modern web — equally suited to games, interactive simulations, and data-driven visualizations." The core remains unchanged; the framing unlocks a wider surface.
 
-**B1. `@nova/persist` descoped:** SQLite continuous mirroring, 3 platform drivers, cloud saves, crash recovery, time-travel debugging, and editor undo/redo all deferred to v2+. v1 uses simple bulk typed array snapshots stored in IndexedDB (web) or filesystem (local).
+### S2. No Headless Mode
+Severity: **Critical — Missing Core Capability**
 
-**B2. `@nova/native` deferred:** Full §10.5 compressed to a design sketch. Marked as Phase 4+ / Future. Core engine does not depend on it.
+A simulation builder must support running without a renderer. Use cases:
+- Automated testing of simulation logic
+- Server-side authoritative simulation (multiplayer)
+- Batch runs for parameter sweeps or Monte Carlo analysis
+- CI/CD validation of deterministic replays
+- AI training loops (thousands of headless simulation instances)
 
-**B3. Custom network serializer deferred:** v1 uses JSON for snapshot serialization. Custom binary format with delta compression deferred until profiling of JSON path informs the design.
+The game loop is implicitly tied to `requestAnimationFrame`. There is no documented way to run the ECS world + fixed update loop without a canvas, browser, or render pass.
 
-**B4. Prefab inheritance phased:** v1 ships flat prefabs with spawn-time overrides. `extends` and `includes` deferred to v1.1.
+**Resolution:** The core game loop must support a headless tick mode:
+```typescript
+const engine = new Engine({ headless: true, tickRate: 60 });
+// No renderer, no canvas. Fixed update runs synchronously.
+engine.tick();           // advance one fixed step
+engine.tickN(100);       // advance 100 steps
+engine.tickUntil(pred);  // advance until predicate returns true
+```
+This is primarily a game loop concern — the renderer plugin simply isn't installed. But the loop itself must not assume `requestAnimationFrame` exists. In Node.js / Electron main process / test harnesses, headless mode is essential.
 
-**B5. Error modes reduced:** Three modes (lenient/strict/pedantic) reduced to two: `dev` (verbose + fallbacks) and `production` (emit events + fallbacks). Pedantic may be added later for CI.
+### S3. No Time Control (Pause, Slow-Motion, Fast-Forward, Step)
+Severity: **High — Missing Core Capability**
 
-**B6. Visual editor phased:** Full visual editor with round-trip persistence is Phase 3. v1 ships entity inspector + system profiler in `@nova/devtools`.
+The `Time` resource has `dt`, `elapsed`, and `frame`, but there is no time scaling API. Games need pause menus. Simulations need slow-motion replay, fast-forward to steady state, and frame-by-frame stepping.
 
-### Gaps Filled
+**Resolution:** Add `timeScale` to the `Time` resource and the engine config:
+```typescript
+engine.setTimeScale(0);     // paused (render continues, fixed update skipped)
+engine.setTimeScale(0.5);   // slow-motion
+engine.setTimeScale(2.0);   // fast-forward (capped by maxSubstepsPerFrame)
+engine.setTimeScale(1.0);   // normal
+engine.step();              // advance exactly one fixed step (when paused)
+```
+`dt` within systems remains the fixed timestep (determinism preserved). `timeScale` controls how many fixed steps run per frame. At `timeScale: 0`, the fixed update loop produces zero steps but the render loop continues — essential for pause menus that still render and animate UI.
 
-**C1. Transform model:** Resolved. `Position` is always local (relative to parent, or world-space if no parent). `WorldTransform` (absolute) is computed by `TransformPropagationSystem`. Renderer reads `WorldTransform`. Gameplay reads/writes `Position`.
+### S4. Electron Target is Absent
+Severity: **High — Missing Deployment Target**
 
-**C2. `maxEntities` config:** Added to Engine config with default 50,000.
+The user explicitly wants Electron-based apps. The SPEC has "web" and "local server" (Node.js SEA) targets but no Electron target. The SEA approach is clever, but Electron provides capabilities that SEA + browser cannot:
 
-**C3. `RenderOrder` component:** Defined as `{ layer: Types.i32 }` built-in from `@nova/renderer-webgpu`. Lower layer draws first.
+| Capability | Node.js SEA + Browser | Electron |
+|---|---|---|
+| Native window chrome | No (browser chrome) | Yes (frameless, custom titlebar) |
+| System tray | No | Yes |
+| File system dialogs | No (browser sandboxed) | Yes (`dialog.showOpenDialog`) |
+| Multi-window | No | Yes |
+| Menu bar | No | Yes (native menus) |
+| GPU context | Browser-mediated | Direct (Chromium) |
+| Auto-update | Manual | electron-updater |
+| Offline-first | Depends on localhost | Built-in |
+| Binary size | ~50–75MB | ~80–120MB |
 
-**C4. State resource cleanup:** Resolved via `onEnter`/`onExit` lifecycle hooks — `insertResource` in `onEnter`, `removeResource` in `onExit`.
+For many simulation applications (tools, editors, dashboards), Electron's native integration is essential.
 
-**C5. Tag component storage:** Clarified: `defineComponent({})` allocates zero bytes in the arena, tracked by archetype bitmask only.
+**Resolution:** Add `--target electron` to `nova export`:
+- Scaffold an Electron main process that loads the Vite build
+- `@nova/native` communicates via Electron IPC (faster than WebSocket, no localhost server)
+- Preload script exposes `contextBridge` for secure native API access
+- Electron-builder or electron-forge for packaging
+- Optional: Electron replaces the Node.js SEA target entirely for desktop distribution
 
-**C6. String interning lifecycle:** Documented. StringTable grows monotonically — interned strings are never freed. Bounded by content for typical use (entity names, prefab IDs). Recommendation: use `Map<Entity, string>` resource for frequently-changing unique strings.
+### S5. Fixed Tick Rate Framing is Too Game-Specific
+Severity: **Medium**
 
-**C7. Write declaration API:** Canonicalized. Component access declarations live on the query: `query(...).read(...).write(...)`. No separate top-level `reads`/`writes` fields.
+The SPEC defaults to 60Hz fixed timestep and frames all examples around 60 FPS gameplay. Simulations need:
+- Higher rates (120Hz, 240Hz, 1000Hz) for precision physics or control systems
+- Lower rates (10Hz, 30Hz) for economic models or turn-based logic
+- Variable rates (adapt tick rate to simulation complexity)
+- Decoupled tick rates (physics at 120Hz, AI at 10Hz, rendering at display refresh)
 
-**C8. Renderer Transform reference:** Fixed. Renderer reads `WorldTransform` (not `Transform`), `Sprite`, `RenderOrder`, `TilemapLayer`, and `Camera`.
+The SPEC *does* say the timestep is configurable, but this is mentioned in passing. Multi-rate simulation (different systems ticking at different frequencies) is not addressed.
 
-### Remaining Open Items
-- WebGPU year reference (#24) — cosmetic, fix when spec is next edited
-- 20 KB core bundle target (#25) — validate with Phase 1 prototype
-- Transform propagation optimization (#20) — address during implementation
-- Tilemap frustum culling (#21) — address during @nova/tilemap implementation
+**Resolution:** Make tick rate a first-class concept:
+```typescript
+const engine = new Engine({
+  fixedTimestep: 1/120,     // 120Hz physics
+  maxSubstepsPerFrame: 8,
+});
+// Future: per-stage tick rate multipliers
+// engine.addStage('ai', [AISystem], { tickDivisor: 6 }); // runs every 6th fixed step
+```
+Per-stage tick divisors are deferred but the architecture should not preclude them.
 
-Summary by Severity
-All critical and high-severity items from Pass 1 are resolved. All Pass 2 inconsistencies (A1–A8) are resolved. Over-engineering items (B1–B6) are addressed via phasing and scope reduction. Gaps (C1–C8) are filled. The spec is ready for Phase 1 implementation.
+### S6. Deterministic PRNG is Missing
+Severity: **High — Missing Core Primitive**
+
+The SPEC emphasizes determinism for networking and replays but does not specify a seeded PRNG. `Math.random()` is non-deterministic and produces different sequences across engines, platforms, and sessions. Any system that uses randomness (AI decisions, particle spawning, proc-gen, damage rolls) breaks determinism.
+
+**Resolution:** Add a `Random` resource to `@nova/core`:
+```typescript
+import { Random } from '@nova/core';
+const rng = resources.get(Random);
+rng.float();              // [0, 1)
+rng.range(1, 6);          // integer in [1, 6]
+rng.vec2(magnitude);      // random unit vector * magnitude
+rng.shuffle(array);       // Fisher-Yates
+rng.seed(42);             // reseed (for replays)
+```
+Use a well-known algorithm (xoshiro256** or PCG) with a seed stored in the `Random` resource. The seed is saved/loaded with `@nova/persist` and transmitted with `@nova/net` snapshots. This is a mandatory foundation for deterministic simulation and should be Phase 1.
+
+### S7. No Data Recording / Replay / Export
+Severity: **High — Missing Simulation Capability**
+
+The `@nova/persist` plugin handles save/load snapshots. But a simulation builder needs continuous data recording:
+- Record component values over time for analysis
+- Export time-series data (CSV, JSON, binary)
+- Visual replay of recorded sessions (scrub timeline)
+- Compare multiple runs (parameter sweeps)
+
+The current snapshot model captures a single point in time. There is no concept of recording a stream of state deltas or sampling component values at regular intervals.
+
+**Resolution:** Add a `@nova/recorder` plugin (Phase 3+):
+```typescript
+engine.addPlugin(RecorderPlugin({
+  components: [Position, Health],    // what to record
+  sampleRate: 10,                    // every 10th tick
+  format: 'binary',                  // or 'json'
+}));
+// API:
+recorder.start();
+recorder.stop();
+recorder.export();         // returns ArrayBuffer or Blob
+recorder.getTimeline();    // for scrub-based replay
+```
+In Phase 1, the simpler capability is making the headless tick loop and `@nova/persist` snapshots sufficient for basic batch recording (snapshot every N ticks). Full timeline recording is Phase 3.
+
+### S8. Entity Limit of ~1M is a Hard Ceiling
+Severity: **Medium — Architectural Constraint**
+
+The handle packing `(gen << 20) | index` caps entities at ~1M. For a game engine this is generous. For a simulation builder, it can be limiting:
+- Particle systems as entities: 1M is reachable
+- Agent-based models with fine granularity: 1M can be hit
+- Cellular automata: easily exceed 1M cells
+
+**Resolution:** Document the limit clearly and provide escape hatches:
+1. GPU particles (`@nova/particles`) are NOT entities — they live in GPU buffers, unlimited count.
+2. Tilemaps are NOT per-tile entities — the tilemap is a single entity with tile data in GPU buffers.
+3. For simulations exceeding 1M agents, use SoA arrays directly (no entity overhead) managed by a custom system.
+4. Future: configurable bit split (e.g., 24-bit index / 8-bit generation for 16M entities, fewer generations). This is a compile-time decision that changes the handle packing constant.
+
+### S9. WebGPU Compute Pipeline is Underspecified
+Severity: **Medium — Missing API Surface**
+
+The SPEC mentions compute shaders for particles and spatial hashing but doesn't specify the developer-facing compute API. For simulation builders, GPU compute is essential:
+- Fluid simulation (SPH, Eulerian)
+- Large-scale agent simulation (BOIDS, flocking)
+- Neural network inference (for game AI or visualization)
+- Procedural generation (terrain, noise)
+
+The renderer section specifies custom *fragment* shaders (`defineMaterial`) but not compute passes.
+
+**Resolution:** Add a compute API to `@nova/renderer-webgpu`:
+```typescript
+const BoidCompute = defineCompute({
+  shader: `@compute @workgroup_size(256) fn main(...) { ... }`,
+  buffers: { positions: 'storage', velocities: 'storage' },
+  dispatch: (count) => [Math.ceil(count / 256), 1, 1],
+});
+
+// In a system:
+renderer.dispatch(BoidCompute, { positions: posBuffer, velocities: velBuffer });
+renderer.readback(posBuffer, targetTypedArray);  // async GPU→CPU
+```
+Phase 1 doesn't need this — the renderer should expose `GPUDevice` access for advanced users. A structured compute API is Phase 4.
+
+### S10. No Multi-World Support
+Severity: **Low — Future Concern**
+
+Simulations sometimes need multiple independent worlds:
+- UI world vs. game world (separate entity spaces)
+- Parallel simulation runs for comparison
+- Prediction/rollback worlds for networking
+
+The SPEC assumes a single `World` instance. The ECS core doesn't prohibit multiple worlds (each `World` has its own arena), but the `Engine` class binds to one.
+
+**Resolution:** Defer to v2. Document that multiple `World` instances are supported at the ECS level but `Engine` manages one. For rollback, `@nova/net` can snapshot/restore a single world. For UI separation, use tag components or layer-based queries rather than separate worlds.
+
+### S11. Event Ring Overflow Semantics Break Determinism
+Severity: **Medium**
+
+In production mode, event ring overflow silently overwrites the oldest events. For a deterministic simulation, losing events means divergent behavior between runs or between client and server.
+
+**Resolution:** Make overflow behavior configurable per event type:
+```typescript
+const HighFreqEvent = defineEvent<{ value: number }>({
+  capacity: 1024,
+  overflow: 'grow',    // default in dev: grow buffer, log warning
+                       // 'drop-oldest': production default, overwrites
+                       // 'halt': halt engine (for simulation-critical events)
+});
+```
+
+### S12. Comparison Table is Aspirational
+Severity: **Low — Cosmetic/Honesty**
+
+Appendix B compares HyperNova's feature list (from a spec with zero lines of implementation) against shipped, battle-tested engines. Every "yes" for HyperNova is vaporware. This is misleading.
+
+**Resolution:** Add a disclaimer: "This comparison reflects the design specification, not current implementation status. Features listed for HyperNova are planned, not shipped." Move the table to a design rationale context rather than presenting it as a competitive comparison.
+
+### S13. `@nova/ui` Layout Model is Underspecified
+Severity: **Low**
+
+The spec says "flexbox-inspired layout engine" but doesn't specify whether this runs as an ECS system, a separate layout pass, or a retained-mode UI tree. For simulation dashboards (charts, controls, data panels), the UI system needs to be capable enough to avoid falling back to HTML overlays.
+
+**Resolution:** This is an open question flagged in TODO.md. Defer the design decision until Phase 4 when `@nova/ui` enters active development. For Phase 1–2, HTML overlays via `@nova/devtools` and standard DOM are sufficient.
+
+### S14. No Configuration / Parameter Injection for Simulations
+Severity: **Medium**
+
+Simulation builders need runtime-configurable parameters: sliders that control gravity, spawn rates, AI weights, etc. The SPEC has typed resources and HMR for dev, but no concept of:
+- A parameter definition API (name, type, range, default)
+- A parameter panel in devtools (auto-generated sliders/inputs)
+- Persisting parameter presets
+- Loading parameters from external config files
+
+**Resolution:** Add a `defineParameter` API to core:
+```typescript
+const Gravity = defineParameter({
+  name: 'Gravity',
+  type: 'f32',
+  default: 400,
+  range: [0, 2000],
+  group: 'Physics',
+});
+
+// In a system:
+const g = resources.get(Parameters).get(Gravity);
+
+// Devtools auto-generates UI for all defined parameters
+// Parameters can be saved/loaded as presets (JSON files)
+```
+This is essentially a typed resource with metadata for UI generation. Phase 2 for the API, Phase 3 for the devtools panel.
+
+---
+
+## Summary — Review Pass 3
+
+### Strengths (Carry Forward)
+- **ECS core design is dimension-agnostic** — global SoA, bitmask queries, generational IDs. Sound foundation.
+- **Plugin architecture is well-composed** — clean dependency resolution, factory pattern, topological sort.
+- **Error handling is thorough** — `Result<T>` at boundaries, infallible hot paths, pre-allocated singletons.
+- **Fixed timestep + interpolation** — correct foundation for deterministic simulation.
+- **Worker architecture** — Task/Job/Stream triple pattern with deterministic result delivery.
+- **Phased delivery** — starts with core, expands outward. Avoids big-bang integration.
+- **Scene/prefab system** — pragmatic JSON format with versioning and migration.
+
+### New Gaps Identified
+| ID | Issue | Severity | Resolution Phase |
+|---|---|---|---|
+| S1 | Identity framing too narrow | High | Phase 1 (documentation) |
+| S2 | No headless mode | Critical | Phase 1 (core loop) |
+| S3 | No time control | High | Phase 1 (core loop) |
+| S4 | No Electron target | High | Phase 5 (packaging) |
+| S5 | Tick rate framing | Medium | Phase 1 (config) |
+| S6 | No deterministic PRNG | High | Phase 1 (core) |
+| S7 | No data recording/export | High | Phase 3 (plugin) |
+| S8 | Entity limit ~1M | Medium | Document + escape hatches |
+| S9 | Compute pipeline underspec | Medium | Phase 4 (renderer) |
+| S10 | No multi-world | Low | Defer to v2 |
+| S11 | Event overflow breaks determinism | Medium | Phase 1 (config) |
+| S12 | Comparison table aspirational | Low | Phase 1 (documentation) |
+| S13 | UI layout model underspec | Low | Phase 4 |
+| S14 | No parameter injection | Medium | Phase 2 (API) + Phase 3 (UI) |
+
+### Open Questions (Remaining)
+- Should the visual editor support collaborative editing?
+- What's the serialization format for animation state machines?
+- Should `@nova/ui` layout run as an ECS system or a separate pass?
+- Should the entity handle bit split be configurable at build time?
+- What's the minimum viable Electron integration (full Electron app vs. Electron as optional wrapper)?
+
+### Verdict
+
+The SPEC is a well-designed 2D game engine specification. To become a *simulation builder*, it needs:
+1. **Headless mode and time control** (Phase 1 — these are core loop features, not add-ons)
+2. **Deterministic PRNG** (Phase 1 — mandatory for any simulation claiming determinism)
+3. **Electron target** (Phase 5 — packaging concern, not architectural)
+4. **Reframing** (Phase 1 — documentation, not code)
+5. **Data recording** (Phase 3 — builds on persist + events)
+6. **Configurable parameters** (Phase 2–3 — typed resources + devtools UI)
+
+None of these require architectural changes to the ECS core. They are capabilities layered on a sound foundation. The updated implementation plan reflects these additions.

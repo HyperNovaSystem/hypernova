@@ -212,6 +212,22 @@ function NativePlugin(config: NativeConfig): Plugin {
 
 When a plugin no-ops, it installs nothing — no stages, no systems, no resources. Downstream plugins that depend on its resources should check availability via `app.getResource()` or guard their own behavior.
 
+**Headless mode:** Plugins that require a GPU or browser DOM should check `app.config.headless` and no-op gracefully:
+
+```typescript
+function RendererPlugin(config?: RendererConfig): Plugin {
+  return {
+    name: 'renderer',
+    install(app) {
+      if (app.config.headless) return;  // no-op in headless mode
+      // ... set up WebGPU, canvas, render systems ...
+    },
+  };
+}
+```
+
+This pattern ensures the same simulation code — including all `addPlugin()` calls — works in both rendered and headless mode. The simulation doesn't need conditional plugin registration.
+
 ## 17.8 Hot Reload (Dev Mode)
 
 During development, plugins can be swapped without restarting the engine:
@@ -226,22 +242,25 @@ The reload sequence:
 3. Call new plugin's `install()` — systems are replaced, resources re-inserted.
 4. Resume game loop.
 
-Component data and entity state are preserved across plugin reloads. Resource values are replaced only if the new plugin calls `insertResource` for the same token.
+Component data and entity state are preserved across plugin reloads. Resource values are replaced only if the new plugin calls `insertResource` for the same token. PRNG state (`Random` resource) is also preserved.
 
 ## 17.9 Canonical Plugin Map
 
 Every `@nova/*` package that touches the engine loop exposes a plugin:
 
-| Plugin | Package | Stages | Resources | Key Components |
-|--------|---------|--------|-----------|----------------|
-| `RendererPlugin` | `@nova/renderer-webgpu` | render-prep | RenderContext | Sprite, Camera, RenderOrder |
-| `PhysicsPlugin` | `@nova/physics-rapier` | physics | PhysicsWorld | RigidBody, Collider |
-| `InputPlugin` | `@nova/input` | input | InputState | — |
-| `WorkersPlugin` | `@nova/workers` | worker-sync | WorkerPool, WorkerResultBuffer | — |
-| `NativePlugin` | `@nova/native` | native-sync | NativeBridge, NativeResultBuffer | — |
-| `StatePlugin` | `@nova/core` | — | StateStack | — |
+| Plugin | Package | Stages | Resources | Key Components | Headless? |
+|--------|---------|--------|-----------|----------------|-----------|
+| `RendererPlugin` | `@nova/renderer-webgpu` | render-prep | RenderContext | Sprite, Camera, RenderOrder | No-op |
+| `PhysicsPlugin` | `@nova/physics-rapier` | physics | PhysicsWorld | RigidBody, Collider | Works |
+| `InputPlugin` | `@nova/input` | input | InputState | — | No-op |
+| `AudioPlugin` | `@nova/audio` | — | AudioMixer | — | No-op |
+| `WorkersPlugin` | `@nova/workers` | worker-sync | WorkerPool, WorkerResultBuffer | — | Works |
+| `PersistPlugin` | `@nova/persist` | — | PersistStore | — | Works |
+| `RecorderPlugin` | `@nova/recorder` | — | Recorder | — | Works |
+| `NativePlugin` | `@nova/native` | native-sync | NativeBridge, NativeResultBuffer | — | Works |
+| `StatePlugin` | `@nova/core` | — | StateStack | — | Works |
 
-All are optional. The core engine runs with zero plugins — just a world and a game loop.
+All are optional. The core engine runs with zero plugins — just a world and a simulation loop. "Headless?" indicates whether the plugin functions in headless mode (no browser/GPU).
 
 ## 17.10 Design Rationale
 

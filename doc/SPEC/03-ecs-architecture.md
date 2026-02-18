@@ -3,7 +3,7 @@
 ## Overview
 
 HyperNova's ECS is the backbone of the engine.
-Every game object is an entity (a numeric ID).
+Every simulation object is an entity (a numeric ID).
 All data lives in components (plain typed arrays).
 All logic lives in systems (functions that query and mutate component data).
 
@@ -69,7 +69,9 @@ This gives us:
 - **Cache-friendly iteration** — systems iterate a list of matching entity IDs; sequential field access within a single array is prefetcher-friendly.
 - **Zero-cost component add/remove** — adding or removing a component flips a bit in the entity's archetype mask. No data is moved between tables.
 
-Destroyed entity indices are recycled via a free list. The typed arrays have "holes" at destroyed indices, but this is harmless — iteration uses query result lists, never raw array walks. For the entity counts typical of 2D games (<100K), the memory overhead of pre-allocated arrays is negligible.
+Destroyed entity indices are recycled via a free list. The typed arrays have "holes" at destroyed indices, but this is harmless — iteration uses query result lists, never raw array walks. For the entity counts typical of 2D simulations (<100K), the memory overhead of pre-allocated arrays is negligible.
+
+> **Entity limit.** The handle packing `(gen << 20) | index` supports ~1M entities with 4096 generations. For simulations exceeding 1M agents, use raw SoA arrays managed by a custom system (bypassing entity overhead), or GPU compute buffers via `@nova/renderer-webgpu`. GPU particles and tilemaps are not entities — they live in GPU buffers with no entity limit.
 
 **String fields** (`Types.string`) use string interning: a global `StringTable` maps strings to integer indices, and `Types.string` fields are backed by `Uint32Array` storing intern indices (index 0 = empty string). String resolution is deferred to point-of-use. The StringTable grows monotonically — interned strings are never freed. For the typical use case (scene metadata, entity names, prefab IDs), the table size is bounded by content and doesn't grow per-frame. If a use case requires frequent unique strings, use a resource (`Map<Entity, string>`) instead of a `Types.string` component field.
 
@@ -247,9 +249,78 @@ const TimerSystem = defineSystem({
 });
 ```
 
+## Deterministic PRNG
+
+`Math.random()` is non-deterministic across engines and sessions. Any simulation that uses randomness — AI decisions, particle spawning, procedural generation, damage rolls — must use the engine's seeded PRNG to preserve determinism.
+
+`@nova/core` provides a `Random` resource backed by a seeded xoshiro256** implementation:
+
+```typescript
+import { Random } from '@nova/core';
+
+const rng = resources.get(Random);
+rng.float();                // [0, 1)
+rng.range(1, 6);            // integer in [1, 6]
+rng.rangeFloat(0.5, 2.0);   // float in [0.5, 2.0)
+rng.vec2(magnitude);         // random unit vector * magnitude
+rng.chance(0.3);             // true 30% of the time
+rng.pick(array);             // random element
+rng.shuffle(array);          // Fisher-Yates in-place
+rng.fork('ai');              // independent sub-stream (deterministic, named)
+```
+
+The seed is stored in the `Random` resource and is:
+- Included in `@nova/persist` snapshots (deterministic restore)
+- Transmitted with `@nova/net` state sync (deterministic multiplayer)
+- Set explicitly for deterministic runs: `new Engine({ seed: 42 })`
+- Defaults to `Date.now()` when not specified
+
+Systems that need independent random sequences use `rng.fork(label)` to create sub-streams that don't interfere with each other's consumption order.
+
+## Simulation Parameters
+
+Simulations benefit from runtime-configurable parameters — sliders for gravity, spawn rates, AI weights, etc. `@nova/core` provides a typed parameter API with metadata for automatic UI generation:
+
+```typescript
+import { defineParameter, Parameters } from '@nova/core';
+
+const Gravity = defineParameter({
+  name: 'Gravity',
+  type: 'f32',
+  default: 400,
+  range: [0, 2000],
+  step: 10,
+  group: 'Physics',
+});
+
+const SpawnRate = defineParameter({
+  name: 'Spawn Rate',
+  type: 'f32',
+  default: 5,
+  range: [0, 100],
+  group: 'Simulation',
+});
+
+// In a system:
+const params = resources.get(Parameters);
+const g = params.get(Gravity);        // number — fully typed
+const rate = params.get(SpawnRate);
+```
+
+Parameters are typed resources with additional metadata (`range`, `step`, `group`) that `@nova/devtools` uses to auto-generate a tuning panel. Parameter presets can be saved/loaded as JSON files.
+
+Parameters can be changed at runtime without restarting the simulation. In headless mode, parameters are set via the `Engine` config or loaded from a preset file:
+
+```typescript
+const engine = new Engine({
+  headless: true,
+  parameters: { Gravity: 800, 'Spawn Rate': 20 },
+});
+```
+
 ## Entity Hierarchy
 
-Games universally need parent-child relationships — a sword attached to a player, UI elements nested in panels, particles anchored to an emitter.
+Simulations and games universally need parent-child relationships — a weapon attached to a character, UI elements nested in panels, particles anchored to an emitter.
 
 HyperNova provides hierarchy through built-in components:
 

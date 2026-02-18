@@ -2,34 +2,42 @@
 
 ## `@nova/core`
 
-The only required package.
+The only required package. Runs in browsers, Node.js, Electron, and headless environments.
+
 Contains:
 - ECS world, entity management, global SoA component storage
 - Generational entity IDs with stale-handle detection
 - Entity hierarchy (Parent/Children, transform propagation)
 - System scheduler (dependency-graph ordering, sequential batch execution) and stage pipeline
-- Game loop (fixed timestep + render interpolation)
+- Simulation loop (fixed timestep + optional render interpolation)
+- Headless mode (`tick()`, `tickN()`, `tickUntil()`) — no DOM or GPU required
+- Time control (`setTimeScale()`, `step()`) — pause, slow-motion, fast-forward
+- Deterministic PRNG (`Random` resource — seeded xoshiro256**)
+- Simulation parameters (`defineParameter()`, `Parameters` resource, presets)
 - Event system (`defineEvent` type tokens, stage-boundary double-buffered, pull-based)
 - Math library (Vec2, Mat3, AABB, Color, lerp/clamp/remap utilities)
 - Typed resource storage
 - Scene loading and prefab instantiation
 - Spatial index (uniform grid, optional quadtree)
+- Plugin system (`EngineBuilder`, dependency resolution, topological sort)
 
-Approximate bundle size target: **< 20 KB** gzipped.
+Approximate bundle size target: **< 25 KB** gzipped.
 
 ## `@nova/renderer-webgpu`
 
-Primary renderer targeting WebGPU with automatic WebGL2 fallback.
+Optional renderer targeting WebGPU with automatic WebGL2 fallback. Not required — the engine runs headless without it.
 
-- **Automatic batching.** Sprites with the same texture and blend mode are batched into a single draw call.  No manual batch management.
-- **Render graph.** A lightweight render graph manages pass ordering, resource lifetimes, and clear/resolve operations.  Custom post-processing passes slot into the graph.
+- **Automatic batching.** Sprites with the same texture and blend mode are batched into a single draw call. No manual batch management.
+- **Render graph.** A lightweight render graph manages pass ordering, resource lifetimes, and clear/resolve operations. Custom post-processing passes slot into the graph.
 - **Sprite rendering.** Textured quads with support for atlases, nine-slices, tiling, tint, and alpha.
-- **Tilemap rendering.** GPU-instanced tilemap rendering.  A 1000x1000 tilemap renders in a single draw call.
+- **Tilemap rendering.** GPU-instanced tilemap rendering with frustum culling — only visible tiles are submitted.
 - **Text.** SDF (Signed Distance Field) text rendering for resolution-independent, styleable text with outlines and shadows.
 - **Camera.** Multiple cameras with independent viewports, zoom, rotation, and render-to-texture.
-- **Custom shaders.** Define custom materials with a shader graph or raw WGSL/GLSL.
+- **Custom shaders.** Define custom materials with raw WGSL (WebGPU) or GLSL (WebGL2 fallback).
+- **Compute pipeline.** Define and dispatch compute shaders for GPU-side simulation (boids, fluid dynamics, spatial hashing, procedural generation). Async readback for GPU→CPU data transfer. See [Renderer](./05-renderer.md) for the compute API.
+- **GPUDevice access.** Advanced users can access the underlying `GPUDevice` for custom render/compute passes.
 
-The renderer reads `Sprite`, `WorldTransform`, `RenderOrder`, `TilemapLayer`, and `Camera` components from the ECS world. It does not own game objects.
+The renderer reads `Sprite`, `WorldTransform`, `RenderOrder`, `TilemapLayer`, and `Camera` components from the ECS world. It does not own simulation objects.
 
 **`RenderOrder` component:** Controls draw order (z-index equivalent). Entities are sorted by `layer` (integer, lower draws first), then by texture/blend mode for batching. Default layer is 0.
 
@@ -224,16 +232,57 @@ Networking primitives — not a full multiplayer framework, but the foundational
 - **Transport agnostic.** Provides a `Transport` interface — implement it with WebSocket, WebRTC DataChannel, or a mock for testing.
 - **Clock sync.** Lightweight NTP-style clock synchronization between client and server.
 
+## `@nova/persist`
+
+Save/load simulation state via typed array snapshots.
+
+- **Save/Load API.** `save(name)`, `load(name)`, `quickSave()`, `quickLoad()`, `listSnapshots()`, `deleteSnapshot(name)`.
+- **Storage backends.** IndexedDB (web), filesystem (local/Electron), in-memory (testing).
+- **Component control.** Components persist by default; opt out via `{ persist: false }`.
+- **PRNG seed.** The `Random` resource seed is included in snapshots for deterministic restore.
+- **Events.** `SaveCompleted` / `LoadCompleted` events for UI feedback.
+
+v2+ deferred: SQLite continuous mirroring, cloud saves, crash recovery.
+
+## `@nova/recorder`
+
+Time-series data recording and replay for simulation analysis.
+
+- **Recording.** Configure which components to record, at what sample rate, in what format (binary or JSON).
+- **API.** `start()`, `stop()`, `export()` (returns `Blob`), `getTimeline(component, entityFilter)`.
+- **Replay.** `loadRecording()`, `getFrame(tick)` — timeline scrub for frame-by-frame playback.
+- **Export.** CSV export for external analysis (spreadsheets, Python, R, notebooks).
+- **Devtools integration.** Timeline scrub bar and recording controls in the devtools panel.
+
+```typescript
+import { RecorderPlugin } from '@nova/recorder';
+
+engine.addPlugin(RecorderPlugin({
+  components: [Position, Health],   // what to record
+  sampleRate: 10,                   // every 10th tick
+  format: 'binary',
+}));
+
+// In game code:
+const recorder = resources.get(Recorder);
+recorder.start();
+// ... run simulation ...
+recorder.stop();
+const blob = recorder.export();     // download or analyze
+```
+
 ## `@nova/devtools`
 
 Development and debugging tools, completely tree-shaken from production builds.
 
 - **Entity Inspector.** Browse all entities, view/edit their components in real time.
 - **System Profiler.** Per-system execution time graph. Identify bottlenecks instantly.
+- **Parameter Panel.** Auto-generated sliders/inputs from `defineParameter()` metadata, grouped by category. Preset save/load.
 - **Physics Debug Overlay.** Render collider shapes, AABBs, contact points, joints.
 - **Asset Browser.** View all loaded assets, their memory usage, and reload individually.
 - **Console.** In-game console for running commands, spawning entities, toggling systems.
 - **State Snapshot Viewer.** Inspect and diff world state between frames (invaluable for networking debugging).
+- **Recording Controls.** Start/stop recording, timeline scrub, CSV export (when `@nova/recorder` is installed).
 
-The devtools panel is rendered as an HTML overlay, independent of the game canvas, using a lightweight UI framework (Preact or vanilla DOM).
+The devtools panel is rendered as an HTML overlay, independent of the simulation canvas, using a lightweight UI framework (Preact or vanilla DOM).
 It communicates with the engine via a message protocol, enabling remote debugging (connect devtools from another browser tab or device).
