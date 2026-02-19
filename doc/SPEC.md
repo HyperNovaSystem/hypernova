@@ -230,6 +230,8 @@ External entity handles encode both index and generation into a single safe Java
 `handle = (generation << 20) | index`, supporting up to ~1M entities and 4096 generations before wrap.
 Internal hot-path code uses the raw index for array access. The generation check happens only at API boundaries (stale handle detection).
 
+**Canonical generation/handle semantics:** generation is stored as a full `Uint16` counter per slot (0–65535). Handles pack only the lower 12 bits (`genLow12 = generation & 0x0fff`) into `(genLow12 << 20) | index`. On recycle, the full 16-bit stored generation increments (wrapping at 65535→0). A handle is valid only if (a) the slot is currently alive and (b) its packed 12-bit generation matches the slot's current low 12 bits. Once generation advances, older handles become stale; after 4096 recycles, low-12 bits can repeat, but dead-slot checks and generation comparison at API boundaries still prevent use-after-destroy in normal lifecycle usage.
+
 ```typescript
 const player = world.spawn();        // index: 0, generation: 1
 const enemy = world.spawn();         // index: 1, generation: 1
@@ -977,6 +979,8 @@ The engine is authored in TypeScript with `strict: true`, `noUncheckedIndexedAcc
 ## Events
 
 Events are defined with `defineEvent<T>()`, consumed with pull-based iteration, and participate in system scheduling — no strings, no callbacks, no allocations.
+
+Runtime simulation events are owned by `@nova/core` and stored in deterministic ring buffers. `mitt` is reserved for non-simulation event buses (editor panels, devtools UI callbacks, other tooling surfaces) where callback ergonomics matter more than deterministic scheduling.
 
 ### Defining Events
 
@@ -1909,7 +1913,7 @@ Scene files are JSON documents that describe a collection of entities:
 }
 ```
 
-**Scene versioning:** The `engineVersion` field records which engine version created the file. On load, the scene loader compares it against the current engine version. If the versions differ, any registered scene migrations run in order (oldest-first) to transform the JSON before entity spawning. Migrations are pure functions: `(sceneJson: object, fromVersion: string) => object`. In strict/pedantic error mode, a missing `engineVersion` field emits a warning. This keeps the migration system simple — no schema registry, just an ordered list of transform functions.
+**Scene versioning:** The `engineVersion` field records which engine version created the file. On load, the scene loader compares it against the current engine version. If the versions differ, any registered scene migrations run in order (oldest-first) to transform the JSON before entity spawning. Migrations are pure functions: `(sceneJson: object, fromVersion: string) => object`. In both `dev` and `production` error modes, a missing `engineVersion` field emits a warning. This keeps the migration system simple — no schema registry, just an ordered list of transform functions.
 
 When a scene references a prefab, only the **overridden fields** are stored in the scene file.
 This keeps scene files small and means updating a prefab definition automatically updates all instances that haven't overridden that field.
@@ -2909,7 +2913,6 @@ const engine = new Engine({
 
 **Production** is for shipping — fallbacks are still used, but `EngineWarning` events are emitted so game code can respond (show retry UI, degrade gracefully). Console logging is minimized.
 
-> A third mode (pedantic — halt on any warning) may be added later if CI testing patterns demand it.
 
 ## 18.5 APIs That Return Results
 
@@ -3022,7 +3025,7 @@ const WorkerTimeout    = defineEvent<{ taskName: string; ticketId: number; elaps
 const EngineHalted     = defineEvent<{ error: EngineError }>();
 ```
 
-These flow through the standard event system. In strict mode, systems can read `EngineWarning` to implement game-level error handling (retry UI, fallback behavior, etc.). In lenient mode, they are logged to `Diag` only.
+These flow through the standard event system. In `production` mode, systems can read `EngineWarning` to implement game-level error handling (retry UI, fallback behavior, etc.). In `dev` mode, warnings are also logged to `Diag`.
 
 ## 18.10 Helper Utilities
 
@@ -3049,7 +3052,7 @@ function orDefault<T>(result: Result<T, EngineError>, fallback: T): T {
 
 **Why pre-allocated error singletons?** Common errors are known at compile time. Returning a frozen singleton is a pointer copy — zero allocation even in error paths.
 
-**Why three error modes?** Lenient maps to rapid prototyping. Strict maps to production. Pedantic maps to CI. Three real workflows, three modes.
+**Why two error modes?** `dev` optimizes feedback speed during development; `production` minimizes logging noise while preserving observable warnings for runtime handling.
 
 **Why keep exceptions for plugin config?** Plugin factories run once, synchronously, before `engine.start()`. An immediate throw with a stack trace pointing at `PhysicsPlugin({ substeps: -1 })` is the fastest path to fixing the bug.
 

@@ -18,6 +18,8 @@ External entity handles encode both index and generation into a single safe Java
 `handle = (generation << 20) | index`, supporting up to ~1M entities and 4096 generations before wrap.
 Internal hot-path code uses the raw index for array access. The generation check happens only at API boundaries (stale handle detection).
 
+**Canonical generation/handle semantics:** generation is stored as a full `Uint16` counter per slot (0–65535). Handles pack only the lower 12 bits (`genLow12 = generation & 0x0fff`) into `(genLow12 << 20) | index`. On recycle, the full 16-bit stored generation increments (wrapping at 65535→0). A handle is valid only if (a) the slot is currently alive and (b) its packed 12-bit generation matches the slot's current low 12 bits. Once generation advances, older handles become stale; after 4096 recycles, low-12 bits can repeat, but dead-slot checks and generation comparison at API boundaries still prevent use-after-destroy in normal lifecycle usage.
+
 ```typescript
 const player = world.spawn();        // index: 0, generation: 1
 const enemy = world.spawn();         // index: 1, generation: 1

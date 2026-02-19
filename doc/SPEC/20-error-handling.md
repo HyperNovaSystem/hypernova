@@ -133,7 +133,6 @@ const engine = new Engine({
 
 **Production** is for shipping — fallbacks are still used, but `EngineWarning` events are emitted so game code can respond (show retry UI, degrade gracefully). Console logging is minimized.
 
-> A third mode (pedantic — halt on any warning) may be added later if CI testing patterns demand it.
 
 ## 18.5 APIs That Return Results
 
@@ -246,7 +245,7 @@ const WorkerTimeout    = defineEvent<{ taskName: string; ticketId: number; elaps
 const EngineHalted     = defineEvent<{ error: EngineError }>();
 ```
 
-These flow through the standard event system. In strict mode, systems can read `EngineWarning` to implement game-level error handling (retry UI, fallback behavior, etc.). In lenient mode, they are logged to `Diag` only.
+These flow through the standard event system. In `production` mode, systems can read `EngineWarning` to implement game-level error handling (retry UI, fallback behavior, etc.). In `dev` mode, warnings are also logged to `Diag`.
 
 ## 18.10 Helper Utilities
 
@@ -257,7 +256,7 @@ function must<T>(result: Result<T, EngineError>, engine: Engine): T {
   engine.halt(result.error);  // typed as `never`, so TypeScript narrows correctly
 }
 
-/** Unwrap or use default — for lenient prototyping */
+/** Unwrap or use default — for rapid prototyping */
 function orDefault<T>(result: Result<T, EngineError>, fallback: T): T {
   return result.ok ? result.value : fallback;
 }
@@ -273,6 +272,6 @@ function orDefault<T>(result: Result<T, EngineError>, fallback: T): T {
 
 **Why pre-allocated error singletons?** Common errors are known at compile time. Returning a frozen singleton is a pointer copy — zero allocation even in error paths.
 
-**Why three error modes?** Lenient maps to rapid prototyping. Strict maps to production. Pedantic maps to CI. Three real workflows, three modes.
+**Why two error modes?** `dev` optimizes feedback speed during development; `production` minimizes logging noise while preserving observable warnings for runtime handling.
 
 **Why keep exceptions for plugin config?** Plugin factories run once, synchronously, before `engine.start()`. An immediate throw with a stack trace pointing at `PhysicsPlugin({ substeps: -1 })` is the fastest path to fixing the bug.
