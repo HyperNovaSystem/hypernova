@@ -9,6 +9,8 @@ The engine is authored in TypeScript with `strict: true`, `noUncheckedIndexedAcc
 
 Events are defined with `defineEvent<T>()`, consumed with pull-based iteration, and participate in system scheduling — no strings, no callbacks, no allocations.
 
+Runtime simulation events are owned by `@nova/core` and stored in deterministic ring buffers. `mitt` is reserved for non-simulation event buses (editor panels, devtools UI callbacks, other tooling surfaces) where callback ergonomics matter more than deterministic scheduling.
+
 ### Defining Events
 
 ```typescript

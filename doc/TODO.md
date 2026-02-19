@@ -37,14 +37,24 @@
 
 **Network Serializer** (`@nova/net`) — v1: JSON snapshot serialization. v2: custom binary with delta compression.
 
-**Recorder** (`@nova/recorder`) — Time-series recording of component data. Configurable sample rate, binary/JSON export, timeline scrub for replay. Builds on the change-detection snapshot infrastructure from `@nova/net`.
+**Recorder** (`@nova/recorder`) — Time-series recording of component data. Configurable sample rate, binary/JSON export, timeline scrub for replay. Builds on core snapshot/change-detection primitives in `@nova/core` (shared by `@nova/net` and `@nova/recorder`).
 
 ### Evaluate before building
 
-**Arena Allocator** — Build custom purpose-built bump allocator (~200 lines):
-- ES2024 `ArrayBuffer(initialSize, { maxByteLength })` with fallback to allocate-and-copy
-- O(1) bump allocation, zero per-block overhead
-- `allocColumn<T>(Type, count): T` returns typed array view over arena buffer
+**Arena allocator decision record (must complete before implementation):**
+- **Alternatives considered:**
+  1. Plain per-component typed arrays (no shared arena)
+  2. Existing JS/WASM allocator package
+  3. Custom bump allocator (single shared arena)
+- **Benchmark criteria:**
+  - Startup allocation time at 50K and 200K entities
+  - Peak RSS and retained heap after component registration
+  - Steady-state frame allocations (target: zero)
+  - Cost of late `defineComponent()` registration in dev mode
+- **Decision checkpoint:**
+  - Record benchmark results in `doc/DECISIONS/arena-allocator.md`
+  - Choose an approach and rationale before implementing allocator internals
+  - If custom allocator wins, implement with ES2024 `ArrayBuffer(initialSize, { maxByteLength })` + allocate-and-copy fallback and provide `allocColumn<T>(Type, count): T`
 
 ### Use existing packages
 
@@ -53,7 +63,7 @@
 | Math | `gl-matrix` (1.5M/wk) | Thin wrapper for scratch-object pooling (zero-alloc). AABB/Color are small additions. |
 | Tween | `@tweenjs/tween.js` (1.5M/wk) | Full coverage: easing, chaining, parallel groups. ECS binding is a thin adapter. |
 | Vite WASM/Workers | `vite-plugin-wasm` + Vite native worker support | Wrap into `@nova/vite-plugin`. |
-| Events | `mitt` (1.5M/wk) | ~50-line typed wrapper for discriminated-union narrowing. Not a separate package. |
+| Events (tooling/UI only) | `mitt` (1.5M/wk) | Use only for non-simulation buses (devtools/editor/UI callbacks). Simulation/runtime events remain `@nova/core` ring buffers. |
 | Electron packaging | `electron-builder` or `electron-forge` | For `--target electron` export. Evaluate which integrates best with Vite. |
 | PRNG algorithm | Reference impl only | xoshiro256** reference in C; port to TypeScript. No npm dependency. |
 
@@ -74,6 +84,7 @@
 
 #### 1b. ECS Core
 - [ ] `@nova/core`: Entity management — generational IDs (`u32` index + `Uint16Array` generation), free list recycling, `spawn()` / `trySpawn()` / `destroy()` / `isAlive()`
+- [ ] `@nova/core`: Canonical handle semantics doc + tests: store 16-bit generation counter, pack lower 12 bits into `(genLow12 << 20) | index`, increment full 16-bit counter on recycle, and treat handles as stale when either packed 12-bit generation mismatches OR the slot is dead
 - [ ] `@nova/core`: Component storage — arena allocator (bump allocator with resizable ArrayBuffer), `defineComponent()` with SoA column allocation, `Types` (f32, i32, u8, u16, u32, bool, string)
 - [ ] `@nova/core`: String interning — `StringTable` with monotonic growth, `Types.string` backed by `Uint32Array`
 - [ ] `@nova/core`: Archetype bitmasks — per-entity archetype mask, add/remove component flips bits
@@ -133,6 +144,12 @@
 #### Phase 1 Deliverable
 **Demo:** A deterministic agent-based simulation (e.g., flocking boids) that runs headless in Node.js producing identical output to the browser-rendered version. Demonstrates: ECS, fixed timestep, time control (pause/fast-forward), deterministic PRNG, headless mode, optional rendering.
 
+**Pass/Fail Gates (must all pass):**
+- [ ] Determinism gate: same seed + same input script produces identical checksum after 10,000 ticks in headless and rendered modes
+- [ ] Headless parity gate: core simulation runs without DOM/canvas and reaches identical final world state to browser run
+- [ ] Allocation gate: zero steady-state allocations per tick for ECS iteration, query execution, and event read/emit in reference boids scene
+- [ ] Error-mode gate: only `dev` and `production` modes exist in config/API/docs and both paths are covered by tests
+
 ---
 
 ### Phase 2 — Gameplay & Simulation Packages
@@ -179,8 +196,20 @@
 - [ ] `@nova/core`: `Parameters` resource for system access
 - [ ] `@nova/core`: Parameter presets — save/load parameter sets as JSON
 
+#### 2h. Snapshot & Change-Detection Substrate (Core)
+- [ ] `@nova/core`: Snapshot primitives for component columns and resource slices (versioned, deterministic ordering)
+- [ ] `@nova/core`: Change-detection API (`markChanged`, per-component/version diff cursors) usable by both recorder and networking
+- [ ] `@nova/core`: Deterministic serialization baseline (stable field/component/entity ordering) with test vectors
+- [ ] `@nova/core`: Document public boundary: `@nova/net` and `@nova/recorder` consume these primitives; they do not own them
+
 #### Phase 2 Deliverable
 **Demo:** A physics platformer with animation, audio, and state management (menu → playing → paused → game over). **Also:** A parameter-driven simulation (e.g., predator-prey ecosystem with tunable birth/death rates) demonstrating `defineParameter` and headless batch runs.
+
+**Pass/Fail Gates (must all pass):**
+- [ ] Physics gate: deterministic collision replay test passes across two identical runs (same seed/input)
+- [ ] Spatial gate: `queryAABB` benchmark meets target latency and remains zero-allocation in stress scene
+- [ ] Parameter gate: `defineParameter` metadata round-trips through preset save/load with no type loss
+- [ ] Core substrate gate: snapshot/change-detection primitives are consumed by at least one integration test each from recorder-facing and net-facing adapters
 
 ---
 
@@ -216,6 +245,12 @@
 
 #### Phase 3 Deliverable
 **Demo:** Build a scene entirely in the visual editor, export, run in production. **Also:** Record a 60-second simulation run, export as CSV, plot results in a notebook. Timeline scrub replay in devtools.
+
+**Pass/Fail Gates (must all pass):**
+- [ ] Recorder gate: 60-second recording exports valid binary + CSV with deterministic tick counts
+- [ ] Replay gate: replayed timeline reproduces sampled component values within defined precision tolerance
+- [ ] Devtools gate: profiler and parameter panel operate without mutating simulation behavior when disabled
+- [ ] CLI gate: `nova create`, `nova dev`, `nova build`, and `nova add` smoke tests pass on reference template
 
 ---
 
@@ -286,6 +321,12 @@
 #### Phase 4 Deliverable
 **Demo:** A networked multiplayer demo (2-player shared simulation with snapshot sync). **Also:** A GPU-compute boid simulation with 100K agents rendered as particles, driven by `defineCompute`.
 
+**Pass/Fail Gates (must all pass):**
+- [ ] Networking gate: two-client deterministic sync test stays within divergence threshold over 5,000 ticks
+- [ ] Worker gate: task/job/stream APIs pass timeout/cancellation/fallback tests
+- [ ] Compute gate: `defineCompute` + `dispatch` + `readback` validated on WebGPU path with documented fallback behavior
+- [ ] Persistence gate: save/load restores world + PRNG state such that post-load replay checksum matches pre-save continuation
+
 ---
 
 ### Phase 5 — Packaging & Distribution
@@ -321,6 +362,12 @@
 
 #### Phase 5 Deliverable
 **Demo:** The same simulation exported as: (1) a static web page on Netlify, (2) an Electron desktop app with native file dialogs, (3) a standalone .exe. All three produce identical simulation results.
+
+**Pass/Fail Gates (must all pass):**
+- [ ] Packaging gate: `nova export --target web|electron|local` produces runnable artifacts on CI
+- [ ] Parity gate: exported targets match deterministic checksum suite for reference simulation
+- [ ] Desktop gate: Electron build verifies IPC/native bridge path and preload security constraints
+- [ ] Distribution gate: artifact size + startup-time budgets meet documented thresholds
 
 ---
 

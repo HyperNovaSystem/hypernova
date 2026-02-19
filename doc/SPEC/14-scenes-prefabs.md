@@ -208,7 +208,7 @@ Scene files are JSON documents that describe a collection of entities:
 }
 ```
 
-**Scene versioning:** The `engineVersion` field records which engine version created the file. On load, the scene loader compares it against the current engine version. If the versions differ, any registered scene migrations run in order (oldest-first) to transform the JSON before entity spawning. Migrations are pure functions: `(sceneJson: object, fromVersion: string) => object`. In strict/pedantic error mode, a missing `engineVersion` field emits a warning. This keeps the migration system simple — no schema registry, just an ordered list of transform functions.
+**Scene versioning:** The `engineVersion` field records which engine version created the file. On load, the scene loader compares it against the current engine version. If the versions differ, any registered scene migrations run in order (oldest-first) to transform the JSON before entity spawning. Migrations are pure functions: `(sceneJson: object, fromVersion: string) => object`. In both `dev` and `production` error modes, a missing `engineVersion` field emits a warning. This keeps the migration system simple — no schema registry, just an ordered list of transform functions.
 
 When a scene references a prefab, only the **overridden fields** are stored in the scene file.
 This keeps scene files small and means updating a prefab definition automatically updates all instances that haven't overridden that field.

@@ -394,3 +394,62 @@ The SPEC is a well-designed 2D game engine specification. To become a *simulatio
 6. **Configurable parameters** (Phase 2–3 — typed resources + devtools UI)
 
 None of these require architectural changes to the ECS core. They are capabilities layered on a sound foundation. The updated implementation plan reflects these additions.
+
+---
+
+## Review Pass 4 — Spec vs. Implementation Plan Consistency Check
+
+*Focus: gaps and sequencing inconsistencies between `doc/SPEC.md` and `doc/TODO.md` as currently written.*
+
+### P4-1. Error-mode model is internally inconsistent
+Severity: **High**
+
+The error-handling spec defines two modes (`dev`, `production`) in the API table, but the rationale text still argues for three modes (`lenient`, `strict`, `pedantic`). This creates ambiguity for implementation and tests.
+
+**Recommendation:** Normalize to one model now (either 2-mode current API or 3-mode future API) and remove the conflicting rationale text until the third mode is actually specified.
+
+### P4-2. Generation storage vs. packed-handle bits are underspecified
+Severity: **Medium**
+
+The plan specifies `Uint16Array` generations, while the spec's packed handle allocates only 12 bits (`gen << 20`), implying truncation/wrap behavior not explicitly documented.
+
+**Recommendation:** Add a single canonical statement covering: stored generation width, packed width, wrap/truncation semantics, and stale-handle guarantees when generations exceed packed bits.
+
+### P4-3. Event-system ownership is contradictory (build vs. reuse)
+Severity: **Medium**
+
+Module strategy says to use `mitt` for events, but Phase 1 defines a custom zero-allocation event ring in `@nova/core`.
+
+**Recommendation:** Split terminology explicitly: use `mitt` only for editor/tooling/UI event buses; keep simulation events in core ring buffers. Document this boundary in both SPEC and TODO.
+
+### P4-4. Recorder phase order conflicts with stated dependency
+Severity: **High**
+
+The plan says `@nova/recorder` "builds on the change-detection snapshot infrastructure from `@nova/net`", but recorder is scheduled in Phase 3 while networking is Phase 4.
+
+**Recommendation:** Either (a) pull the required snapshot/change-detection substrate into `@nova/core` by Phase 2, or (b) move recorder to Phase 4 after `@nova/net` foundation exists.
+
+### P4-5. Phase deliverables still lack explicit acceptance gates
+Severity: **Medium**
+
+Phases define demos, but there are no measurable exit criteria (determinism checks, perf thresholds, memory ceilings, API stability gates). This increases schedule risk and makes "done" subjective.
+
+**Recommendation:** Add 3–5 objective pass/fail gates per phase (e.g., deterministic replay checksum match, max frame budget under reference scene, zero-allocation assertion for hot systems, CLI smoke checks).
+
+### P4-6. "Evaluate before building" section contains an implementation directive
+Severity: **Low**
+
+The "Evaluate before building" section says to "Build custom purpose-built bump allocator," which reads as a pre-decided build choice rather than an evaluation track.
+
+**Recommendation:** Reword this section as a decision record template: alternatives considered, benchmark criteria, and decision checkpoint before committing to custom allocator implementation.
+
+### Summary — Pass 4
+
+The architecture remains coherent, but the highest-value fixes are documentation/ordering cleanups rather than deep redesign:
+1. Resolve the error-mode contradiction.
+2. Fix recorder/net sequencing.
+3. Clarify generation-bit semantics.
+4. Separate runtime event bus from tooling event bus.
+5. Add hard acceptance criteria per phase.
+
+These updates would materially reduce implementation ambiguity without changing the core technical direction.
