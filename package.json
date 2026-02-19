@@ -1,23 +1,30 @@
 {
   "name": "hypernova-engine",
   "version": "1.0.0",
-  "description": "game engine",
-  "main": "index.js",
+  "description": "A modular, ECS-first simulation engine for the modern web",
+  "type": "module",
+  "main": "src/core/index.ts",
   "directories": {
     "doc": "doc"
   },
   "scripts": {
+    "dev:tower-defense": "vite serve examples/tower-defense",
+    "build:tower-defense": "vite build examples/tower-defense",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fingerskier/hypernova.git"
   },
-  "keywords": [],
+  "keywords": ["game-engine", "ecs", "simulation", "typescript"],
   "author": "",
   "license": "ISC",
   "bugs": {
     "url": "https://github.com/fingerskier/hypernova/issues"
   },
-  "homepage": "https://github.com/fingerskier/hypernova#readme"
+  "homepage": "https://github.com/fingerskier/hypernova#readme",
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0"
+  }
 }
