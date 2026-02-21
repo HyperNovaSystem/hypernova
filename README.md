@@ -1,5 +1,5 @@
 # HyperNova Engine
 
-A modular, ECS-first, WebGPU-powered 2D game engine built for the modern web.
+A modular, Typescript, ECS-first 2D simulation engine.
 
 See [doc/SPEC.md](doc/SPEC.md) for the full specification.
