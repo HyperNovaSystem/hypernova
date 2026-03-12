@@ -9,7 +9,9 @@
   },
   "scripts": {
     "dev:tower-defense": "vite serve examples/tower-defense",
+    "dev:nitrogen-pump": "vite serve examples/nitrogen-pump",
     "build:tower-defense": "vite build examples/tower-defense",
+    "build:nitrogen-pump": "vite build examples/nitrogen-pump",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

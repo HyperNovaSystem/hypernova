@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HyperNova — LN2 Pump Simulation (ECS)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0d1117; color: #e6edf3;
+    }
+    header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 24px; background: #161b22; border-bottom: 1px solid #30363d;
+    }
+    header h1 { font-size: 16px; }
+    #controls { display: flex; gap: 10px; align-items: center; }
+    #controls button {
+      padding: 6px 14px; border: 1px solid #30363d; border-radius: 4px;
+      background: #1c2128; color: #e6edf3; cursor: pointer; font-size: 13px;
+    }
+    #controls button:hover { background: #30363d; }
+    #controls .active { background: #3fb950; color: #000; border-color: #3fb950; }
+    main { display: flex; gap: 16px; padding: 16px 24px; }
+    canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; }
+    #info {
+      font-family: 'Consolas', monospace; font-size: 13px;
+      background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+      padding: 16px; min-width: 280px; line-height: 1.8;
+    }
+    .val { color: #39d2c0; }
+    .label { color: #8b949e; }
+    .warn { color: #d29922; }
+    .crit { color: #f85149; }
+    .ok { color: #3fb950; }
+    h3 { color: #58a6ff; font-size: 13px; margin: 8px 0 4px; border-bottom: 1px solid #30363d; padding-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>HyperNova ECS — LN2 Pump Simulation</h1>
+    <div id="controls">
+      <span id="tick-count" style="font-family:monospace;color:#39d2c0;">Tick: 0</span>
+      <button id="btn-toggle">Start</button>
+      <button id="btn-step">Step</button>
+      <button id="btn-pump">Start Pump</button>
+      <button id="btn-valve-open">Open Valves</button>
+      <button id="btn-reset">Reset</button>
+    </div>
+  </header>
+  <main>
+    <canvas id="canvas" width="700" height="400"></canvas>
+    <div id="info">Loading ECS simulation...</div>
+  </main>
+  <script type="module" src="src/main.ts"></script>
+</body>
+</html>
