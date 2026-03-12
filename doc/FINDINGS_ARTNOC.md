@@ -18,7 +18,7 @@ Findings from building a side-scrolling action game ("Artnoc") using the HyperNo
 
 ### 2.1 No Built-In Health / Stat Component
 
-The engine's only example (tower defense) defines its own `Health` component. For the Contra clone, enemies need per-entity health tracking, but the ECS only supports numeric typed-array fields. There is no general-purpose "stats" or "health" component provided by the engine.
+The engine's only example (tower defense) defines its own `Health` component. For the clone, enemies need per-entity health tracking, but the ECS only supports numeric typed-array fields. There is no general-purpose "stats" or "health" component provided by the engine.
 
 **Workaround**: We repurposed `Sprite.animTimer` as an enemy health counter. This is a hack — it conflates animation state with gameplay data. A proper solution would be a dedicated `Health` component, but the 64-component bitmask limit (see 2.3) makes adding components a budgeted decision.
 
@@ -38,7 +38,7 @@ For an action game, this means:
 
 ### 2.3 64-Component Hard Limit
 
-The archetype bitmask uses 2x32-bit integers, capping the engine at 64 component types. For a Contra clone, we used 12 components and were fine, but a more complex game (RPG, simulation) could easily hit this ceiling.
+The archetype bitmask uses 2x32-bit integers, capping the engine at 64 component types. For this clone, we used 12 components and were fine, but a more complex game (RPG, simulation) could easily hit this ceiling.
 
 **Impact**: Forces consolidation of related data into fewer components (e.g., putting health into Sprite), which undermines the "composition over inheritance" ECS philosophy.
 
@@ -57,7 +57,7 @@ This is error-prone. The `AABBUtil.overlaps()` helper exists in `math.ts` but is
 
 ### 2.5 No Audio Support
 
-There is no audio system or even a stub. A Contra clone without sound effects (gunshots, explosions, death jingle) is incomplete. The spec mentions Web Audio API support as planned.
+There is no audio system or even a stub. A clone without sound effects (gunshots, explosions, death jingle) is incomplete. The spec mentions Web Audio API support as planned.
 
 ### 2.6 No Asset Loading Pipeline
 
@@ -81,7 +81,7 @@ All component fields must be backed by TypedArrays (f32, i32, u8, etc.). You can
 
 ### 2.8 No Entity Relationship / Hierarchy
 
-There is no parent-child or entity hierarchy system. In Contra, this matters for:
+There is no parent-child or entity hierarchy system. In this clone, this matters for:
 - Attaching weapons to characters
 - Grouping boss sub-parts
 - Scene graph for complex entities
@@ -96,7 +96,7 @@ Each call to `world.query(query(...))` inside a system's `execute()` creates a n
 
 ### 2.10 No Input Abstraction
 
-The engine provides no input handling. All keyboard/mouse/gamepad input must be wired up manually via DOM events. The tower defense example and our Contra clone both implement their own input state management.
+The engine provides no input handling. All keyboard/mouse/gamepad input must be wired up manually via DOM events. The tower defense example and our clone both implement their own input state management.
 
 **Recommendation**: Provide at minimum a `defineResource<InputMap>` pattern or small input plugin that handles key state, press/release edge detection, and gamepad support.
 
@@ -147,7 +147,7 @@ Storing enemy HP in `Sprite.animTimer` is brittle. If any system updates `animTi
 
 ### 4.3 No Scrolling Lock for Boss Arena
 
-Classic Contra locks the camera during boss fights. Our implementation relies on the natural scroll clamp, but doesn't prevent backward scrolling during the boss encounter. The level design works around this with a wall entity.
+Classic game locks the camera during boss fights. Our implementation relies on the natural scroll clamp, but doesn't prevent backward scrolling during the boss encounter. The level design works around this with a wall entity.
 
 ---
 
