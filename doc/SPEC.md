@@ -1,6 +1,7 @@
-# HyperNova Engine — A Modular Simulation Engine for the Modern Web
+# HyperNova Engine
+## A Modular Simulation Engine
 
-> An ECS-first, WebGPU-powered simulation engine built for browsers and Electron — equally suited to games, interactive simulations, and data-driven visualizations.
+> An ECS-first, WebGPU-powered simulation engine built for browsers and Electron — equally suited to games, interactive simulations, and data-driven visualization and control-systems.
 
 ---
 
