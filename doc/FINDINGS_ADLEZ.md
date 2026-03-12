@@ -19,17 +19,16 @@ essential for games with scene/room/level transitions.
 `Projectile`, `Door`) and looped `world.destroy()` on each. For game-over
 restart, we resorted to `location.reload()`.
 
-**Impact:** High. Room transitions are the most basic Zelda-like pattern and
+**Impact:** High. Room transitions are the most basic pattern and
 they require tearing down/rebuilding entity sets constantly.
 
 ---
 
 ### F-02: No sprite/texture/asset pipeline
 
-The engine provides zero support for loading or rendering images, sprite sheets,
-or tilesets. The entire rendering layer must be hand-written by the game. For a
-Zelda clone, this means drawing every character, tile, and item with Canvas2D
-primitives (rectangles, circles, bezier curves).
+The engine provides zero support for loading or rendering images, sprite sheets, or tilesets.
+The entire rendering layer must be hand-written by the game.
+For this clone, this means drawing every character, tile, and item with Canvas2D primitives (rectangles, circles, bezier curves).
 
 **Workaround:** Wrote a complete `AdlezRenderer` class (~400 lines) using
 raw Canvas2D calls. Characters are drawn with colored rectangles and simple
@@ -90,7 +89,7 @@ would need sprite sheet definitions, frame timing, and state transitions.
 
 ### F-06: No audio system
 
-No audio playback support. A Zelda clone begs for sword slashes, item pickups,
+No audio playback support.  This clone begs for sword slashes, item pickups,
 enemy hits, and background music.
 
 **Workaround:** None. Game is silent.
@@ -168,7 +167,7 @@ first-class support or at least a pattern recommendation.
 ### F-11: No camera system
 
 No viewport, scrolling, or camera abstraction. The game is locked to a
-single-screen room (256x176 pixels scaled 3x) which is fine for classic Zelda
+single-screen room (256x176 pixels scaled 3x) which is fine for classic
 rooms but limiting for larger maps.
 
 ### F-12: No UI/HUD framework
