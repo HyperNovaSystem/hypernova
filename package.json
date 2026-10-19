@@ -8,10 +8,10 @@
     "doc": "doc"
   },
   "scripts": {
-    "dev:tower-defense": "vite serve examples/tower-defense",
-    "dev:nitrogen-pump": "vite serve examples/nitrogen-pump",
-    "build:tower-defense": "vite build examples/tower-defense",
-    "build:nitrogen-pump": "vite build examples/nitrogen-pump",
+    "dev:tower-defense": "vite serve examples/tower-defense --config vite.config.ts",
+    "dev:nitrogen-pump": "vite serve examples/nitrogen-pump --config vite.config.ts",
+    "build:tower-defense": "vite build examples/tower-defense --config vite.config.ts",
+    "build:nitrogen-pump": "vite build examples/nitrogen-pump --config vite.config.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
