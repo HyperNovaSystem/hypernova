@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HyperNova — Examples</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #0d0d1a;
+      color: #ccc;
+      font-family: 'Courier New', monospace;
+      min-height: 100vh;
+      padding: 40px 16px;
+    }
+
+    main {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      color: #7ec8e3;
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+
+    p {
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }
+
+    ul {
+      list-style: none;
+    }
+
+    li {
+      margin-bottom: 12px;
+    }
+
+    p a {
+      color: #7ec8e3;
+    }
+
+    li a {
+      display: block;
+      padding: 16px;
+      border: 1px solid #2a2a4a;
+      background: #14142a;
+      color: #ccc;
+      text-decoration: none;
+    }
+
+    li a:hover,
+    li a:focus-visible {
+      border-color: #7ec8e3;
+    }
+
+    li a strong {
+      display: block;
+      color: #7ec8e3;
+      margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>HyperNova</h1>
+    <p>Examples for the modular, ECS-first 2D simulation engine.
+      Source: <a href="https://github.com/HyperNovaSystem/hypernova">HyperNovaSystem/hypernova</a></p>
+    <ul>
+      <li>
+        <a href="./tower-defense/">
+          <strong>Tower Defense</strong>
+          Pick from four towers and hold the path against incoming waves.
+        </a>
+      </li>
+      <li>
+        <a href="./nitrogen-pump/">
+          <strong>LN2 Pump Simulation</strong>
+          Step an ECS model of a liquid-nitrogen pumping system: pump, valves, ticks.
+        </a>
+      </li>
+    </ul>
+  </main>
+</body>
+</html>
